@@ -1,0 +1,42 @@
+name: Sync iSeller ke Supabase
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch: {}
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tarik order terbaru iSeller -> Supabase
+        env:
+          ISELLER_CLIENT_ID: ${{ secrets.ISELLER_CLIENT_ID }}
+          ISELLER_CLIENT_SECRET: ${{ secrets.ISELLER_CLIENT_SECRET }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          cat > sync.mjs <<'EOF'
+          const CID=process.env.ISELLER_CLIENT_ID, CSEC=process.env.ISELLER_CLIENT_SECRET;
+          const SUPA=process.env.SUPABASE_URL.replace(/\/$/,''), SR=process.env.SUPABASE_SERVICE_KEY;
+          const sleep=ms=>new Promise(s=>setTimeout(s,ms));
+          const tr=await fetch('https://isellershop.com/oauth/token',{method:'POST',headers:{Authorization:'Basic '+Buffer.from(CID+':'+CSEC).toString('base64'),'Content-Type':'application/x-www-form-urlencoded'},body:'grant_type=client_credentials'});
+          if(!tr.ok){ console.error('Token gagal', tr.status, await tr.text()); process.exit(1); }
+          const tj=await tr.json();
+          const base=tj.resource_url.replace(/\/$/,'')+'/api/v2';
+          const H={Authorization:'Bearer '+tj.access_token,'Content-Type':'application/json'};
+          async function getPage(p){ for(let i=0;i<3;i++){ try{ const r=await fetch(base+'/GetOrders',{method:'POST',headers:H,body:JSON.stringify({time_zone:7,page:p})}); if(r.ok) return await r.json(); }catch(e){} await sleep(3000);} return null; }
+          let lo=3700, hi=8000;
+          if(((((await getPage(lo))||{}).orders)||[]).length===0) lo=2000;
+          while(hi-lo>1){ const mid=Math.floor((lo+hi)/2); const c=((((await getPage(mid))||{}).orders)||[]).length; if(c>0) lo=mid; else hi=mid; }
+          const last=lo;
+          const now=new Date(Date.now()+7*3600*1000); now.setDate(now.getDate()-1);
+          const cut=now.toISOString().slice(0,10);
+          const rows=[];
+          for(let p=last;p>=1;p--){ const r=await getPage(p); if(!r) continue; const o=r.orders||[]; if(!o.length) continue; const newest=(o[o.length-1].order_date||'').slice(0,10);
+            for(const x of o){ const d=(x.order_date||'').slice(0,10); if(d<cut) continue;
+              rows.push({date:d, outlet:x.outlet_name||'', cashier:((x.cashier_first_name||'')+' '+(x.cashier_last_name||'')).trim(), customer:((x.customer_first_name||'')+' '+(x.customer_last_name||'')).trim(), phone:x.customer_phone_number||'', total:Number(x.total_amount)||0, status:x.status||'', paid:x.payment_status==='paid', ref:x.order_reference||'', channel:x.channel||''}); }
+            if(newest<cut) break; }
+          await fetch(SUPA+'/rest/v1/iseller_orders?date=gte.'+cut,{method:'DELETE',headers:{apikey:SR,Authorization:'Bearer '+SR}});
+          for(let i=0;i<rows.length;i+=500){ const ch=rows.slice(i,i+500); await fetch(SUPA+'/rest/v1/iseller_orders',{method:'POST',headers:{apikey:SR,Authorization:'Bearer '+SR,'Content-Type':'application/json',Prefer:'return=minimal'},body:JSON.stringify(ch)}); }
+          console.log('OK: '+rows.length+' order sejak '+cut+' (halaman terakhir '+last+')');
+          EOF
+          node sync.mjs
