@@ -2,7 +2,12 @@ name: Sync iSeller ke Supabase
 on:
   schedule:
     - cron: '*/15 * * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'auto = normal (2 hari) · full = rekonsiliasi sebulan penuh (tarik ulang untuk nyocokin ke iSeller)'
+        default: 'auto'
+        required: false
 concurrency:
   group: sync-iseller
   cancel-in-progress: false
@@ -16,6 +21,7 @@ jobs:
           ISELLER_CLIENT_SECRET: ${{ secrets.ISELLER_CLIENT_SECRET }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          MODE: ${{ github.event.inputs.mode }}
         run: |
           cat > sync.mjs <<'EOF'
           const CID=process.env.ISELLER_CLIENT_ID, CSEC=process.env.ISELLER_CLIENT_SECRET;
@@ -29,8 +35,19 @@ jobs:
           const H={Authorization:'Bearer '+tj.access_token,'Content-Type':'application/json'};
           async function getPage(p){ for(let i=0;i<3;i++){ try{ const r=await fetch(base+'/GetOrders',{method:'POST',headers:H,body:JSON.stringify({time_zone:7,page:p})}); if(r.ok) return await r.json(); }catch(e){} await sleep(3000);} return null; }
           async function getTx(p){ for(let i=0;i<3;i++){ try{ const r=await fetch(base+'/GetTransactions',{method:'POST',headers:H,body:JSON.stringify({time_zone:7,page:p,page_size:5000})}); if(r.ok) return await r.json(); }catch(e){} await sleep(3000);} return null; }
-          const now=new Date(Date.now()+7*3600*1000); now.setDate(now.getDate()-1);
-          const cut=now.toISOString().slice(0,10);
+
+          // ===== JENDELA SYNC =====
+          // Normal: 2 hari (kemarin+hari ini) tiap 15 menit -> cepat & segar.
+          // FULL (sekali sehari ~02:xx WIB, atau dipicu manual mode=full): tarik ulang
+          //   sebulan penuh (dari 4 hari sebelum awal bulan) supaya order yang telat
+          //   masuk iSeller di tanggal lama ikut ke-sync -> angka nyocok ke iSeller.
+          const nowWIB=new Date(Date.now()+7*3600*1000);
+          const WIDE=(process.env.MODE==='full')||(nowWIB.getUTCHours()===2 && nowWIB.getUTCMinutes()<15);
+          const cd=new Date(nowWIB.getTime());
+          if(WIDE){ cd.setUTCDate(1); cd.setUTCDate(cd.getUTCDate()-4); }
+          else { cd.setUTCDate(cd.getUTCDate()-1); }
+          const cut=cd.toISOString().slice(0,10);
+          console.log('MODE '+(WIDE?'FULL (rekonsiliasi sebulan)':'cepat (2 hari)')+' · cut='+cut);
 
           // ===== 1) ORDERS =====
           let lo=3700, hi=8000;
@@ -52,8 +69,9 @@ jobs:
           if(((((await getTx(tlo))||{}).transactions)||[]).length===0) tlo=1;
           while(thi-tlo>1){ const mid=Math.floor((tlo+thi)/2); const c=((((await getTx(mid))||{}).transactions)||[]).length; if(c>0) tlo=mid; else thi=mid; }
           const tlast=tlo;
+          const tfloor = WIDE ? 1 : Math.max(1,tlast-4);
           const refs=[], seen={};
-          for(let p=tlast;p>=Math.max(1,tlast-4);p--){ const r=await getTx(p); if(!r) continue; const tt=r.transactions||[]; if(!tt.length) continue; const oldest=(tt[0].transaction_date||'').slice(0,10);
+          for(let p=tlast;p>=tfloor;p--){ const r=await getTx(p); if(!r) continue; const tt=r.transactions||[]; if(!tt.length) continue; const oldest=(tt[0].transaction_date||'').slice(0,10);
             for(const t of tt){ if(t.type!=='refund') continue; const d=(t.transaction_date||'').slice(0,10); if(d<cut) continue; const id=String(t.transaction_id||''); if(seen[id]) continue; seen[id]=1; refs.push({date:d, ref:t.order_reference||'', amount:Number(t.amount)||0}); }
             if(oldest<cut) break; }
           // lookup outlet/cashier tiap refund dari order-nya
