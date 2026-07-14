@@ -38,11 +38,13 @@ jobs:
 
           // ===== JENDELA SYNC =====
           // Normal: 2 hari (kemarin+hari ini) tiap 15 menit -> cepat & segar.
-          // FULL (sekali sehari ~02:xx WIB, atau dipicu manual mode=full): tarik ulang
-          //   sebulan penuh (dari 4 hari sebelum awal bulan) supaya order yang telat
-          //   masuk iSeller di tanggal lama ikut ke-sync -> angka nyocok ke iSeller.
+          // FULL (2x sehari ~02:xx & ~14:xx WIB, atau dipicu manual mode=full): tarik ulang
+          //   sebulan penuh (dari 4 hari sebelum awal bulan) supaya order yang telat masuk
+          //   / pembayaran yang baru dikonfirmasi di iSeller ikut ke-sync -> angka nyocok.
+          //   (Order ditarik dulu semua, baru DELETE+INSERT di akhir ~1-2 menit -> blip minim.)
           const nowWIB=new Date(Date.now()+7*3600*1000);
-          const WIDE=(process.env.MODE==='full')||(nowWIB.getUTCHours()===2 && nowWIB.getUTCMinutes()<15);
+          const _h=nowWIB.getUTCHours();
+          const WIDE=(process.env.MODE==='full')||((_h===2 || _h===14) && nowWIB.getUTCMinutes()<15);
           const cd=new Date(nowWIB.getTime());
           if(WIDE){ cd.setUTCDate(1); cd.setUTCDate(cd.getUTCDate()-4); }
           else { cd.setUTCDate(cd.getUTCDate()-1); }
@@ -64,22 +66,39 @@ jobs:
           for(let i=0;i<rows.length;i+=500){ const ch=rows.slice(i,i+500); await fetch(SUPA+'/rest/v1/iseller_orders',{method:'POST',headers:{...SH,'Content-Type':'application/json',Prefer:'return=minimal'},body:JSON.stringify(ch)}); }
           console.log('OK order: '+rows.length+' sejak '+cut+' (halaman terakhir '+last+')');
 
-          // ===== 2) REFUNDS (dari GetTransactions, type=refund) =====
+          // ===== 2) REFUNDS + GRAB/TOKO (dari GetTransactions) =====
+          const GT_CUT='2026-01-01';                    // histori grab/toko ditarik sejak Januari
+          const scanCut = WIDE ? GT_CUT : cut;          // di WIDE scan mundur sampai Jan (buat grab/toko); fast cukup 2 hari
+          const PT={ 'GRAB MART':'grabmart', 'TOKOPEDIA':'tokopedia' };
           let tlo=100, thi=400;
           if(((((await getTx(tlo))||{}).transactions)||[]).length===0) tlo=1;
           while(thi-tlo>1){ const mid=Math.floor((tlo+thi)/2); const c=((((await getTx(mid))||{}).transactions)||[]).length; if(c>0) tlo=mid; else thi=mid; }
           const tlast=tlo;
           const tfloor = WIDE ? 1 : Math.max(1,tlast-4);
-          const refs=[], seen={};
+          const refs=[], seen={}, gtx=[];
           for(let p=tlast;p>=tfloor;p--){ const r=await getTx(p); if(!r) continue; const tt=r.transactions||[]; if(!tt.length) continue; const oldest=(tt[0].transaction_date||'').slice(0,10);
-            for(const t of tt){ if(t.type!=='refund') continue; const d=(t.transaction_date||'').slice(0,10); if(d<cut) continue; const id=String(t.transaction_id||''); if(seen[id]) continue; seen[id]=1; refs.push({date:d, ref:t.order_reference||'', amount:Number(t.amount)||0}); }
-            if(oldest<cut) break; }
-          // lookup outlet/cashier tiap refund dari order-nya
-          const uref=[...new Set(refs.map(r=>r.ref))]; const omap={};
+            for(const t of tt){ const d=(t.transaction_date||'').slice(0,10);
+              if(t.type==='refund' && d>=cut){ const id=String(t.transaction_id||''); if(!seen[id]){ seen[id]=1; refs.push({date:d, ref:t.order_reference||'', amount:Number(t.amount)||0}); } }
+              else if(WIDE && t.type==='sale' && PT[t.payment_type_name] && d>=GT_CUT){ gtx.push({ref:t.order_reference||'', date:d, amt:Number(t.amount)||0, ch:PT[t.payment_type_name]}); }
+            }
+            if(oldest<scanCut) break; }
+          // lookup outlet tiap ref (refund + grab/toko) dari order-nya
+          const uref=[...new Set(refs.map(r=>r.ref).concat(gtx.map(g=>g.ref)))]; const omap={};
           for(let i=0;i<uref.length;i+=80){ const b=uref.slice(i,i+80); const il=b.map(x=>'"'+x.replace(/#/g,'%23')+'"').join(','); try{ const rr=await fetch(SUPA+'/rest/v1/iseller_orders?ref=in.('+il+')&select=ref,outlet,cashier&limit=5000',{headers:SH}); const jj=await rr.json(); for(const row of jj){ if(!omap[row.ref]) omap[row.ref]={outlet:row.outlet,cashier:row.cashier}; } }catch(e){} }
           const rrows=refs.map(r=>({date:r.date, outlet:(omap[r.ref]||{}).outlet||'', cashier:(omap[r.ref]||{}).cashier||'', customer:'', phone:'', total:-Math.abs(r.amount), status:'refund', paid:true, ref:r.ref, channel:'refund'}));
           await fetch(SUPA+'/rest/v1/iseller_orders?date=gte.'+cut+'&channel=eq.refund',{method:'DELETE',headers:SH});
           for(let i=0;i<rrows.length;i+=500){ const ch=rrows.slice(i,i+500); await fetch(SUPA+'/rest/v1/iseller_orders',{method:'POST',headers:{...SH,'Content-Type':'application/json',Prefer:'return=minimal'},body:JSON.stringify(ch)}); }
           console.log('OK refund: '+rrows.length+' sejak '+cut+' (tx halaman terakhir '+tlast+')');
+
+          // ===== 3) GRAB/TOKO -> tabel report_data (dibaca dashboard menu Report) — hanya WIDE =====
+          if(WIDE){
+            const gt={ grabmart:{}, tokopedia:{} };
+            for(const g of gtx){ const out=(omap[g.ref]||{}).outlet||'(Lainnya)'; const bo=gt[g.ch]; if(!bo[out]) bo[out]={}; if(!bo[out][g.date]) bo[out][g.date]=[0,0]; bo[out][g.date][0]+=g.amt; bo[out][g.date][1]+=1; }
+            const stamp=new Date(Date.now()+7*3600*1000).toISOString().slice(0,16).replace('T',' ')+' WIB';
+            for(const key of ['grabmart','tokopedia']){ const bo=gt[key]; if(!Object.keys(bo).length) continue;
+              await fetch(SUPA+'/rest/v1/report_data',{method:'POST',headers:{...SH,'Content-Type':'application/json',Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify({key:key, data:{updated:stamp, byOutlet:bo}})});
+            }
+            console.log('OK grab/toko: grabmart '+Object.keys(gt.grabmart).length+' outlet · tokopedia '+Object.keys(gt.tokopedia).length+' outlet');
+          }
           EOF
           node sync.mjs
