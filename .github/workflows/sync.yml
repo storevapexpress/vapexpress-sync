@@ -34,6 +34,7 @@ jobs:
           const base=tj.resource_url.replace(/\/$/,'')+'/api/v2';
           const H={Authorization:'Bearer '+tj.access_token,'Content-Type':'application/json'};
           async function getPage(p){ for(let i=0;i<3;i++){ try{ const r=await fetch(base+'/GetOrders',{method:'POST',headers:H,body:JSON.stringify({time_zone:7,page:p})}); if(r.ok) return await r.json(); }catch(e){} await sleep(3000);} return null; }
+          async function getPageD(p){ for(let i=0;i<3;i++){ try{ const r=await fetch(base+'/GetOrders',{method:'POST',headers:H,body:JSON.stringify({time_zone:7,page:p,includes:'OrderDetails'})}); if(r.ok) return await r.json(); }catch(e){} await sleep(3000);} return null; }
           async function getTx(p){ for(let i=0;i<3;i++){ try{ const r=await fetch(base+'/GetTransactions',{method:'POST',headers:H,body:JSON.stringify({time_zone:7,page:p,page_size:5000})}); if(r.ok) return await r.json(); }catch(e){} await sleep(3000);} return null; }
 
           // ===== JENDELA SYNC =====
@@ -100,5 +101,24 @@ jobs:
             }
             console.log('OK grab/toko: grabmart '+Object.keys(gt.grabmart).length+' outlet · tokopedia '+Object.keys(gt.tokopedia).length+' outlet');
           }
+
+          // ===== 4) ORDER ITEMS (produk per struk) — 14 hari terakhir, buat Follow Up HOT =====
+          // GetOrders + includes:"OrderDetails" -> order_details[] keisi. Tulis ke iseller_order_items (tabel terpisah).
+          try{
+            const idCut=new Date(nowWIB.getTime()); idCut.setUTCDate(idCut.getUTCDate()-14);
+            const iCut=idCut.toISOString().slice(0,10);
+            const items=[]; const seenRef={};
+            for(let p=last;p>=1;p--){ const r=await getPageD(p); if(!r) continue; const o=r.orders||[]; if(!o.length) continue; const newest=(o[o.length-1].order_date||'').slice(0,10);
+              for(const x of o){ const d=(x.order_date||'').slice(0,10); if(d<iCut) continue; if(x.payment_status!=='paid') continue;
+                const ref=x.order_reference||''; if(!ref||seenRef[ref]) continue; seenRef[ref]=1;
+                const dets=x.order_details||[]; let sq=0;
+                for(const it of dets){ items.push({ref:ref, seq:sq++, product_name:(it.product_name||'').slice(0,200), sku:it.sku||'', qty:Number(it.quantity)||0, price:Number(it.base_price)||0, order_date:d}); }
+              }
+              if(newest<iCut) break; }
+            // ganti data 14 hari terakhir (self-heal): hapus lalu insert
+            await fetch(SUPA+'/rest/v1/iseller_order_items?order_date=gte.'+iCut,{method:'DELETE',headers:SH});
+            for(let i=0;i<items.length;i+=500){ const ch=items.slice(i,i+500); await fetch(SUPA+'/rest/v1/iseller_order_items',{method:'POST',headers:{...SH,'Content-Type':'application/json',Prefer:'return=minimal'},body:JSON.stringify(ch)}); }
+            console.log('OK items: '+items.length+' produk (sejak '+iCut+', '+Object.keys(seenRef).length+' struk)');
+          }catch(e){ console.error('items pass gagal (dilewati):', e.message); }
           EOF
           node sync.mjs
