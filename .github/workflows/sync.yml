@@ -69,7 +69,11 @@ jobs:
           { let p=1, guard=0;
             while(guard++<400){ const r=await getPage(p,caCut); if(!r) break; const o=r.orders||[]; if(!o.length) break;
               for(const x of o){ const d=(x.order_date||'').slice(0,10); if(d<cut) continue;
-                rows.push({date:d, outlet:x.outlet_name||'', cashier:((x.cashier_first_name||'')+' '+(x.cashier_last_name||'')).trim(), customer:((x.customer_first_name||'')+' '+(x.customer_last_name||'')).trim(), phone:x.customer_phone_number||'', total:Number(x.total_amount)||0, status:x.status||'', paid:x.payment_status==='paid', ref:x.order_reference||'', channel:x.channel||''}); }
+                // paid=true kalau UDAH DIBAYAR. Order 'completed' = udah dibayar (termasuk yg lalu
+                //   di-refund/'Dikembalikan' -> payment_status jadi 'refunded' tapi tetap masuk KOTOR,
+                //   samain cara iSeller: Bersih = Kotor - Refund). 'draft'/belum bayar TIDAK dihitung.
+                const isPaid = (x.status==='completed') || (x.payment_status==='paid');
+                rows.push({date:d, outlet:x.outlet_name||'', cashier:((x.cashier_first_name||'')+' '+(x.cashier_last_name||'')).trim(), customer:((x.customer_first_name||'')+' '+(x.customer_last_name||'')).trim(), phone:x.customer_phone_number||'', total:Number(x.total_amount)||0, status:x.status||'', paid:isPaid, ref:x.order_reference||'', channel:x.channel||''}); }
               p++;
             }
             console.log('orders: '+rows.length+' baris (order_date>='+cut+') dari '+(p-1)+' halaman (created_after='+caCut+')'); }
@@ -141,4 +145,3 @@ jobs:
           }catch(e){ console.error('items pass gagal (dilewati):', e.message); }
           EOF
           node sync.mjs
-          
