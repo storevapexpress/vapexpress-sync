@@ -33,30 +33,14 @@ jobs:
           const tj=await tr.json();
           const base=tj.resource_url.replace(/\/$/,'')+'/api/v2';
           const H={Authorization:'Bearer '+tj.access_token,'Content-Type':'application/json'};
-          async function getPage(p){ for(let i=0;i<3;i++){ try{ const r=await fetch(base+'/GetOrders',{method:'POST',headers:H,body:JSON.stringify({time_zone:7,page:p})}); if(r.ok) return await r.json(); }catch(e){} await sleep(3000);} return null; }
-          async function getPageD(p){ for(let i=0;i<3;i++){ try{ const r=await fetch(base+'/GetOrders',{method:'POST',headers:H,body:JSON.stringify({time_zone:7,page:p,includes:'OrderDetails'})}); if(r.ok) return await r.json(); }catch(e){} await sleep(3000);} return null; }
-          async function getTx(p){ for(let i=0;i<3;i++){ try{ const r=await fetch(base+'/GetTransactions',{method:'POST',headers:H,body:JSON.stringify({time_zone:7,page:p,page_size:5000})}); if(r.ok) return await r.json(); }catch(e){} await sleep(3000);} return null; }
-          // ingat "halaman terakhir" run sebelumnya biar ga binary-search dari nol (hemat ~1-2 menit/run)
-          async function stGet(k){ try{ const r=await fetch(SUPA+'/rest/v1/sync_state?key=eq.'+k+'&select=value',{headers:SH}); const j=await r.json(); return (j&&j[0])?Number(j[0].value)||0:0; }catch(e){ return 0; } }
-          async function stSet(k,v){ try{ await fetch(SUPA+'/rest/v1/sync_state',{method:'POST',headers:{...SH,'Content-Type':'application/json',Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify({key:k,value:v,updated_at:new Date().toISOString()})}); }catch(e){} }
-          // cari halaman terakhir CEPAT: mulai dari (tersimpan - 3), naik sampai kosong. Fallback binary-search kalau state kosong.
-          // cnt = fungsi yang ngembaliin jumlah item di 1 halaman (1 panggilan API per halaman).
-          async function findLast(cnt, saved, floorLo, floorHi){
-            if(saved>0){ let base0=Math.max(1,saved-3); let anchor=0;
-              // mundur cari halaman yang masih ada isinya (kalau saved kejauhan)
-              for(let p=base0; p>=1; p-=5){ if(await cnt(p)>0){ anchor=p; break; } }
-              if(anchor===0) anchor=1;
-              // naik sampai halaman kosong
-              let last=anchor, q=anchor+1, guard=0;
-              while(guard++<80){ if(await cnt(q)>0){ last=q; q++; } else break; }
-              return last;
-            }
-            // fallback: binary-search (run pertama, state belum ada)
-            let lo=floorLo, hi=floorHi;
-            if(await cnt(lo)===0) lo=Math.floor(floorLo/2);
-            while(hi-lo>1){ const mid=Math.floor((lo+hi)/2); if(await cnt(mid)>0) lo=mid; else hi=mid; }
-            return lo;
-          }
+          // created_after (ISO tanpa tz) + sort CreatedDate DESC -> order TERBARU di page 1.
+          //   Jauh lebih hemat: ga perlu scan ribuan halaman dari belakang.
+          //   ca = 'YYYY-MM-DDTHH:MM:SS' (WIB, karena time_zone:7).
+          async function getPage(p,ca){ const b={time_zone:7,page:p,sort:'CreatedDate',sort_direction:'DESC'}; if(ca) b.created_after=ca; for(let i=0;i<3;i++){ try{ const r=await fetch(base+'/GetOrders',{method:'POST',headers:H,body:JSON.stringify(b)}); if(r.ok) return await r.json(); }catch(e){} await sleep(3000);} return null; }
+          async function getPageD(p,ca){ const b={time_zone:7,page:p,includes:'OrderDetails',sort:'CreatedDate',sort_direction:'DESC'}; if(ca) b.created_after=ca; for(let i=0;i<3;i++){ try{ const r=await fetch(base+'/GetOrders',{method:'POST',headers:H,body:JSON.stringify(b)}); if(r.ok) return await r.json(); }catch(e){} await sleep(3000);} return null; }
+          async function getTx(p,ca){ const b={time_zone:7,page:p,page_size:5000,sort:'CreatedDate',sort_direction:'DESC'}; if(ca) b.created_after=ca; for(let i=0;i<3;i++){ try{ const r=await fetch(base+'/GetTransactions',{method:'POST',headers:H,body:JSON.stringify(b)}); if(r.ok) return await r.json(); }catch(e){} await sleep(3000);} return null; }
+          // (dulu ada findLast/stGet/stSet buat scan halaman dari belakang — sekarang ga perlu,
+          //  karena created_after + sort DESC langsung kasih order terbaru di page 1.)
 
           // ===== JENDELA SYNC =====
           // Normal: 2 hari (kemarin+hari ini) tiap 15 menit -> cepat & segar.
@@ -71,45 +55,51 @@ jobs:
           if(WIDE){ cd.setUTCDate(1); cd.setUTCDate(cd.getUTCDate()-4); }
           else { cd.setUTCDate(cd.getUTCDate()-1); }
           const cut=cd.toISOString().slice(0,10);
-          console.log('MODE '+(WIDE?'FULL (rekonsiliasi sebulan)':'cepat (2 hari)')+' · cut='+cut);
+          // created_after buat AMBIL data (hemat call). Mundur 3 hari dari 'cut' biar aman
+          //   thd selisih timezone + order/pembayaran telat. Format ISO tanpa tz (WIB).
+          const caD=new Date(cd.getTime()); caD.setUTCDate(caD.getUTCDate()-3);
+          const caCut=caD.toISOString().slice(0,10)+'T00:00:00';
+          console.log('MODE '+(WIDE?'FULL (rekonsiliasi sebulan)':'cepat (2 hari)')+' · cut='+cut+' · created_after='+caCut);
 
-          // ===== 1) ORDERS =====
-          const savedOrd=await stGet('orders_last_page');
-          const last=await findLast(async p=>(((await getPage(p))||{}).orders||[]).length, savedOrd, 3700, 8000);
-          await stSet('orders_last_page', last);
-          console.log('halaman order terakhir: '+last+(savedOrd?' (dari state '+savedOrd+')':' (binary-search)'));
+          // ===== 1) ORDERS ===== (created_after + sort DESC: page 1 = terbaru)
+          // Server udah MEMFILTER by created_after -> semua halaman isinya cuma order sejak caCut.
+          //   Tinggal ambil page 1,2,3… sampai halaman KOSONG (habis). Guard 400 = pengaman.
+          //   Filter simpan tetap pakai order_date>=cut -> hasil di Supabase identik cara lama.
           const rows=[];
-          for(let p=last;p>=1;p--){ const r=await getPage(p); if(!r) continue; const o=r.orders||[]; if(!o.length) continue; const newest=(o[o.length-1].order_date||'').slice(0,10);
-            for(const x of o){ const d=(x.order_date||'').slice(0,10); if(d<cut) continue;
-              rows.push({date:d, outlet:x.outlet_name||'', cashier:((x.cashier_first_name||'')+' '+(x.cashier_last_name||'')).trim(), customer:((x.customer_first_name||'')+' '+(x.customer_last_name||'')).trim(), phone:x.customer_phone_number||'', total:Number(x.total_amount)||0, status:x.status||'', paid:x.payment_status==='paid', ref:x.order_reference||'', channel:x.channel||''}); }
-            if(newest<cut) break; }
+          { let p=1, guard=0;
+            while(guard++<400){ const r=await getPage(p,caCut); if(!r) break; const o=r.orders||[]; if(!o.length) break;
+              for(const x of o){ const d=(x.order_date||'').slice(0,10); if(d<cut) continue;
+                rows.push({date:d, outlet:x.outlet_name||'', cashier:((x.cashier_first_name||'')+' '+(x.cashier_last_name||'')).trim(), customer:((x.customer_first_name||'')+' '+(x.customer_last_name||'')).trim(), phone:x.customer_phone_number||'', total:Number(x.total_amount)||0, status:x.status||'', paid:x.payment_status==='paid', ref:x.order_reference||'', channel:x.channel||''}); }
+              p++;
+            }
+            console.log('orders: '+rows.length+' baris (order_date>='+cut+') dari '+(p-1)+' halaman (created_after='+caCut+')'); }
           // hapus order (BUKAN refund) di jendela, lalu insert order
           await fetch(SUPA+'/rest/v1/iseller_orders?date=gte.'+cut+'&channel=neq.refund',{method:'DELETE',headers:SH});
           for(let i=0;i<rows.length;i+=500){ const ch=rows.slice(i,i+500); await fetch(SUPA+'/rest/v1/iseller_orders',{method:'POST',headers:{...SH,'Content-Type':'application/json',Prefer:'return=minimal'},body:JSON.stringify(ch)}); }
-          console.log('OK order: '+rows.length+' sejak '+cut+' (halaman terakhir '+last+')');
+          console.log('OK order: '+rows.length+' sejak '+cut);
 
-          // ===== 2) REFUNDS + GRAB/TOKO (dari GetTransactions) =====
+          // ===== 2) REFUNDS + GRAB/TOKO (dari GetTransactions) ===== (created_after + sort DESC)
           const GT_CUT='2026-01-01';                    // histori grab/toko ditarik sejak Januari
-          const scanCut = WIDE ? GT_CUT : cut;          // di WIDE scan mundur sampai Jan (buat grab/toko); fast cukup 2 hari
+          // created_after buat AMBIL: fast mundur 3 hari (caCut), WIDE dari Januari (biar grab/toko kekejar)
+          const txCa = WIDE ? (GT_CUT+'T00:00:00') : caCut;
           const PT={ 'GRAB MART':'grabmart', 'TOKOPEDIA':'tokopedia' };
-          const savedTx=await stGet('tx_last_page');
-          const tlast=await findLast(async p=>(((await getTx(p))||{}).transactions||[]).length, savedTx, 100, 400);
-          await stSet('tx_last_page', tlast);
-          const tfloor = WIDE ? 1 : Math.max(1,tlast-4);
           const refs=[], seen={}, gtx=[];
-          for(let p=tlast;p>=tfloor;p--){ const r=await getTx(p); if(!r) continue; const tt=r.transactions||[]; if(!tt.length) continue; const oldest=(tt[0].transaction_date||'').slice(0,10);
-            for(const t of tt){ const d=(t.transaction_date||'').slice(0,10);
-              if(t.type==='refund' && d>=cut){ const id=String(t.transaction_id||''); if(!seen[id]){ seen[id]=1; refs.push({date:d, ref:t.order_reference||'', amount:Number(t.amount)||0}); } }
-              else if(WIDE && t.type==='sale' && PT[t.payment_type_name] && d>=GT_CUT){ gtx.push({ref:t.order_reference||'', date:d, amt:Number(t.amount)||0, ch:PT[t.payment_type_name]}); }
+          { let p=1, guard=0;
+            while(guard++<600){ const r=await getTx(p,txCa); if(!r) break; const tt=r.transactions||[]; if(!tt.length) break;
+              for(const t of tt){ const d=(t.transaction_date||'').slice(0,10);
+                if(t.type==='refund' && d>=cut){ const id=String(t.transaction_id||''); if(!seen[id]){ seen[id]=1; refs.push({date:d, ref:t.order_reference||'', amount:Number(t.amount)||0}); } }
+                else if(WIDE && t.type==='sale' && PT[t.payment_type_name] && d>=GT_CUT){ gtx.push({ref:t.order_reference||'', date:d, amt:Number(t.amount)||0, ch:PT[t.payment_type_name]}); }
+              }
+              p++;
             }
-            if(oldest<scanCut) break; }
+            console.log('tx: '+refs.length+' refund + '+gtx.length+' grab/toko dari '+(p-1)+' halaman (created_after='+txCa+')'); }
           // lookup outlet tiap ref (refund + grab/toko) dari order-nya
           const uref=[...new Set(refs.map(r=>r.ref).concat(gtx.map(g=>g.ref)))]; const omap={};
           for(let i=0;i<uref.length;i+=80){ const b=uref.slice(i,i+80); const il=b.map(x=>'"'+x.replace(/#/g,'%23')+'"').join(','); try{ const rr=await fetch(SUPA+'/rest/v1/iseller_orders?ref=in.('+il+')&select=ref,outlet,cashier&limit=5000',{headers:SH}); const jj=await rr.json(); for(const row of jj){ if(!omap[row.ref]) omap[row.ref]={outlet:row.outlet,cashier:row.cashier}; } }catch(e){} }
           const rrows=refs.map(r=>({date:r.date, outlet:(omap[r.ref]||{}).outlet||'', cashier:(omap[r.ref]||{}).cashier||'', customer:'', phone:'', total:-Math.abs(r.amount), status:'refund', paid:true, ref:r.ref, channel:'refund'}));
           await fetch(SUPA+'/rest/v1/iseller_orders?date=gte.'+cut+'&channel=eq.refund',{method:'DELETE',headers:SH});
           for(let i=0;i<rrows.length;i+=500){ const ch=rrows.slice(i,i+500); await fetch(SUPA+'/rest/v1/iseller_orders',{method:'POST',headers:{...SH,'Content-Type':'application/json',Prefer:'return=minimal'},body:JSON.stringify(ch)}); }
-          console.log('OK refund: '+rrows.length+' sejak '+cut+' (tx halaman terakhir '+tlast+')');
+          console.log('OK refund: '+rrows.length+' sejak '+cut);
 
           // ===== 3) GRAB/TOKO -> tabel report_data (dibaca dashboard menu Report) — hanya WIDE =====
           if(WIDE){
@@ -131,14 +121,19 @@ jobs:
             const idCut=new Date(nowWIB.getTime());
             if(WIDE){ idCut.setUTCDate(1); } else { idCut.setUTCDate(idCut.getUTCDate()-3); }
             const iCut=idCut.toISOString().slice(0,10);
+            // created_after buat AMBIL items: mundur 3 hari dari iCut (aman timezone/telat)
+            const iCaD=new Date(idCut.getTime()); iCaD.setUTCDate(iCaD.getUTCDate()-3);
+            const iCa=iCaD.toISOString().slice(0,10)+'T00:00:00';
             const items=[]; const seenRef={};
-            for(let p=last;p>=1;p--){ const r=await getPageD(p); if(!r) continue; const o=r.orders||[]; if(!o.length) continue; const newest=(o[o.length-1].order_date||'').slice(0,10);
-              for(const x of o){ const d=(x.order_date||'').slice(0,10); if(d<iCut) continue; if(x.payment_status!=='paid') continue;
-                const ref=x.order_reference||''; if(!ref||seenRef[ref]) continue; seenRef[ref]=1;
-                const dets=x.order_details||[]; let sq=0;
-                for(const it of dets){ items.push({ref:ref, seq:sq++, product_name:(it.product_name||'').slice(0,200), sku:it.sku||'', qty:Number(it.quantity)||0, price:Number(it.base_price)||0, order_date:d}); }
-              }
-              if(newest<iCut) break; }
+            { let p=1, guard=0;
+              while(guard++<400){ const r=await getPageD(p,iCa); if(!r) break; const o=r.orders||[]; if(!o.length) break;
+                for(const x of o){ const d=(x.order_date||'').slice(0,10); if(d<iCut) continue; if(x.payment_status!=='paid') continue;
+                  const ref=x.order_reference||''; if(!ref||seenRef[ref]) continue; seenRef[ref]=1;
+                  const dets=x.order_details||[]; let sq=0;
+                  for(const it of dets){ items.push({ref:ref, seq:sq++, product_name:(it.product_name||'').slice(0,200), sku:it.sku||'', qty:Number(it.quantity)||0, price:Number(it.base_price)||0, order_date:d}); }
+                }
+                p++;
+              } }
             // self-heal 3 hari terakhir aja: hapus 3 hari lalu insert (histori >3 hari TIDAK disentuh)
             await fetch(SUPA+'/rest/v1/iseller_order_items?order_date=gte.'+iCut,{method:'DELETE',headers:SH});
             for(let i=0;i<items.length;i+=500){ const ch=items.slice(i,i+500); await fetch(SUPA+'/rest/v1/iseller_order_items',{method:'POST',headers:{...SH,'Content-Type':'application/json',Prefer:'return=minimal'},body:JSON.stringify(ch)}); }
@@ -146,3 +141,4 @@ jobs:
           }catch(e){ console.error('items pass gagal (dilewati):', e.message); }
           EOF
           node sync.mjs
+          
