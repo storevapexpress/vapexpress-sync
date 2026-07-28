@@ -10,11 +10,12 @@ on:
         required: false
 concurrency:
   group: sync-iseller
-  cancel-in-progress: true   # run baru BATALIN yg lama/hang (biar ga numpuk & nyangkut)
+  cancel-in-progress: false  # JANGAN cancel run yg lagi jalan (biar selesai penuh, ga nyicil).
+                             #   timeout-minutes di bawah yg jaga biar ga hang selamanya.
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 12       # auto-mati kalau kelamaan (anti-hang sampai 6 jam)
+    timeout-minutes: 10       # auto-mati kalau kelamaan (anti-hang; run normal < 3 menit)
     steps:
       - name: Tarik order + refund terbaru iSeller -> Supabase
         env:
@@ -37,9 +38,9 @@ jobs:
           // created_after (ISO tanpa tz) + sort CreatedDate DESC -> order TERBARU di page 1.
           //   Jauh lebih hemat: ga perlu scan ribuan halaman dari belakang.
           //   ca = 'YYYY-MM-DDTHH:MM:SS' (WIB, karena time_zone:7).
-          async function getPage(p,ca){ const b={time_zone:7,page:p,sort:'CreatedDate',sort_direction:'DESC'}; if(ca) b.created_after=ca; for(let i=0;i<3;i++){ try{ const r=await fetch(base+'/GetOrders',{method:'POST',headers:H,body:JSON.stringify(b)}); if(r.ok) return await r.json(); }catch(e){} await sleep(3000);} return null; }
-          async function getPageD(p,ca){ const b={time_zone:7,page:p,includes:'OrderDetails',sort:'CreatedDate',sort_direction:'DESC'}; if(ca) b.created_after=ca; for(let i=0;i<3;i++){ try{ const r=await fetch(base+'/GetOrders',{method:'POST',headers:H,body:JSON.stringify(b)}); if(r.ok) return await r.json(); }catch(e){} await sleep(3000);} return null; }
-          async function getTx(p,ca){ const b={time_zone:7,page:p,page_size:5000,sort:'CreatedDate',sort_direction:'DESC'}; if(ca) b.created_after=ca; for(let i=0;i<3;i++){ try{ const r=await fetch(base+'/GetTransactions',{method:'POST',headers:H,body:JSON.stringify(b)}); if(r.ok) return await r.json(); }catch(e){} await sleep(3000);} return null; }
+          async function getPage(p,ca){ const b={time_zone:7,page:p,sort:'CreatedDate',sort_direction:'DESC'}; if(ca) b.created_after=ca; for(let i=0;i<6;i++){ try{ const r=await fetch(base+'/GetOrders',{method:'POST',headers:H,body:JSON.stringify(b)}); if(r.ok) return await r.json(); }catch(e){} await sleep(2000);} return null; }
+          async function getPageD(p,ca){ const b={time_zone:7,page:p,includes:'OrderDetails',sort:'CreatedDate',sort_direction:'DESC'}; if(ca) b.created_after=ca; for(let i=0;i<6;i++){ try{ const r=await fetch(base+'/GetOrders',{method:'POST',headers:H,body:JSON.stringify(b)}); if(r.ok) return await r.json(); }catch(e){} await sleep(2000);} return null; }
+          async function getTx(p,ca){ const b={time_zone:7,page:p,page_size:5000,sort:'CreatedDate',sort_direction:'DESC'}; if(ca) b.created_after=ca; for(let i=0;i<6;i++){ try{ const r=await fetch(base+'/GetTransactions',{method:'POST',headers:H,body:JSON.stringify(b)}); if(r.ok) return await r.json(); }catch(e){} await sleep(2000);} return null; }
           // (dulu ada findLast/stGet/stSet buat scan halaman dari belakang — sekarang ga perlu,
           //  karena created_after + sort DESC langsung kasih order terbaru di page 1.)
 
