@@ -81,10 +81,7 @@ jobs:
                 //   samain cara iSeller: Bersih = Kotor - Refund). 'draft'/belum bayar TIDAK dihitung.
                 const isPaid = (x.status==='completed') || (x.payment_status==='paid');
                 rows.push({date:d, outlet:x.outlet_name||'', cashier:((x.cashier_first_name||'')+' '+(x.cashier_last_name||'')).trim(), customer:((x.customer_first_name||'')+' '+(x.customer_last_name||'')).trim(), phone:x.customer_phone_number||'', total:Number(x.total_amount)||0, status:x.status||'', paid:isPaid, ref:x.order_reference||'', channel:x.channel||''}); }
-              // sort DESC by CreatedDate -> order dgn CREATED tertua di akhir. Kalau order_date tertua
-              //   udah < caCut window, halaman berikut pasti lebih lama -> STOP (anti scan berlebih).
-              const oldest=(o[o.length-1].order_date||'').slice(0,10);
-              if(oldest && oldest < caCut.slice(0,10)) break;
+              // Server udah filter by created_after -> scan sampai halaman KOSONG (habis). Guard 400 = backstop.
               p++;
             }
             console.log('orders: '+rows.length+' baris (order_date>='+cut+') dari '+(p-1)+' halaman (created_after='+caCut+')'+(ordersFail?' [GAGAL SEBAGIAN - SKIP tulis]':'')); }
@@ -101,16 +98,12 @@ jobs:
           const txCa = WIDE ? (GT_CUT+'T00:00:00') : caCut;
           const PT={ 'GRAB MART':'grabmart', 'TOKOPEDIA':'tokopedia' };
           const refs=[], seen={}, gtx=[];
-          { let p=1, guard=0; const txStop = WIDE ? GT_CUT : cut;
+          { let p=1, guard=0;
             while(guard++<600){ const r=await getTx(p,txCa); if(!r) break; const tt=r.transactions||[]; if(!tt.length) break;
               for(const t of tt){ const d=(t.transaction_date||'').slice(0,10);
                 if(t.type==='refund' && d>=cut){ const id=String(t.transaction_id||''); if(!seen[id]){ seen[id]=1; refs.push({date:d, ref:t.order_reference||'', amount:Number(t.amount)||0}); } }
                 else if(WIDE && t.type==='sale' && PT[t.payment_type_name] && d>=GT_CUT){ gtx.push({ref:t.order_reference||'', date:d, amt:Number(t.amount)||0, ch:PT[t.payment_type_name]}); }
               }
-              // sort DESC -> transaksi TERTUA di akhir array. Kalau udah < batas (txStop),
-              //   halaman berikut pasti lebih lama -> STOP (biar ga scan sampai infinite/timeout).
-              const oldest=(tt[tt.length-1].transaction_date||'').slice(0,10);
-              if(oldest && oldest < txStop) break;
               p++;
             }
             console.log('tx: '+refs.length+' refund + '+gtx.length+' grab/toko dari '+(p-1)+' halaman (created_after='+txCa+')'); }
