@@ -10,10 +10,11 @@ on:
         required: false
 concurrency:
   group: sync-iseller
-  cancel-in-progress: false
+  cancel-in-progress: true   # run baru BATALIN yg lama/hang (biar ga numpuk & nyangkut)
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 12       # auto-mati kalau kelamaan (anti-hang sampai 6 jam)
     steps:
       - name: Tarik order + refund terbaru iSeller -> Supabase
         env:
@@ -65,22 +66,34 @@ jobs:
           // Server udah MEMFILTER by created_after -> semua halaman isinya cuma order sejak caCut.
           //   Tinggal ambil page 1,2,3… sampai halaman KOSONG (habis). Guard 400 = pengaman.
           //   Filter simpan tetap pakai order_date>=cut -> hasil di Supabase identik cara lama.
-          const rows=[];
+          const rows=[]; let ordersFail=false;
           { let p=1, guard=0;
-            while(guard++<400){ const r=await getPage(p,caCut); if(!r) break; const o=r.orders||[]; if(!o.length) break;
+            while(guard++<400){
+              const r=await getPage(p,caCut);
+              // BEDAKAN gagal-fetch vs habis: r=null -> FETCH GAGAL (retry 3x mentok) -> JANGAN stop
+              //   diam2 (bikin order kepotong). Tandai gagal & stop, nanti DELETE+INSERT di-SKIP
+              //   biar data lama TETAP AMAN (lebih baik ga update drpd nimpa dgn data bolong).
+              if(!r){ ordersFail=true; console.error('getPage gagal di page '+p+' -> ABORT orders (data lama dipertahankan)'); break; }
+              const o=r.orders||[]; if(!o.length) break;   // beneran habis
               for(const x of o){ const d=(x.order_date||'').slice(0,10); if(d<cut) continue;
                 // paid=true kalau UDAH DIBAYAR. Order 'completed' = udah dibayar (termasuk yg lalu
                 //   di-refund/'Dikembalikan' -> payment_status jadi 'refunded' tapi tetap masuk KOTOR,
                 //   samain cara iSeller: Bersih = Kotor - Refund). 'draft'/belum bayar TIDAK dihitung.
                 const isPaid = (x.status==='completed') || (x.payment_status==='paid');
                 rows.push({date:d, outlet:x.outlet_name||'', cashier:((x.cashier_first_name||'')+' '+(x.cashier_last_name||'')).trim(), customer:((x.customer_first_name||'')+' '+(x.customer_last_name||'')).trim(), phone:x.customer_phone_number||'', total:Number(x.total_amount)||0, status:x.status||'', paid:isPaid, ref:x.order_reference||'', channel:x.channel||''}); }
+              // sort DESC by CreatedDate -> order dgn CREATED tertua di akhir. Kalau order_date tertua
+              //   udah < caCut window, halaman berikut pasti lebih lama -> STOP (anti scan berlebih).
+              const oldest=(o[o.length-1].order_date||'').slice(0,10);
+              if(oldest && oldest < caCut.slice(0,10)) break;
               p++;
             }
-            console.log('orders: '+rows.length+' baris (order_date>='+cut+') dari '+(p-1)+' halaman (created_after='+caCut+')'); }
-          // hapus order (BUKAN refund) di jendela, lalu insert order
-          await fetch(SUPA+'/rest/v1/iseller_orders?date=gte.'+cut+'&channel=neq.refund',{method:'DELETE',headers:SH});
-          for(let i=0;i<rows.length;i+=500){ const ch=rows.slice(i,i+500); await fetch(SUPA+'/rest/v1/iseller_orders',{method:'POST',headers:{...SH,'Content-Type':'application/json',Prefer:'return=minimal'},body:JSON.stringify(ch)}); }
-          console.log('OK order: '+rows.length+' sejak '+cut);
+            console.log('orders: '+rows.length+' baris (order_date>='+cut+') dari '+(p-1)+' halaman (created_after='+caCut+')'+(ordersFail?' [GAGAL SEBAGIAN - SKIP tulis]':'')); }
+          // hapus order (BUKAN refund) di jendela, lalu insert order — CUMA kalau tarik SUKSES penuh.
+          if(!ordersFail){
+            await fetch(SUPA+'/rest/v1/iseller_orders?date=gte.'+cut+'&channel=neq.refund',{method:'DELETE',headers:SH});
+            for(let i=0;i<rows.length;i+=500){ const ch=rows.slice(i,i+500); await fetch(SUPA+'/rest/v1/iseller_orders',{method:'POST',headers:{...SH,'Content-Type':'application/json',Prefer:'return=minimal'},body:JSON.stringify(ch)}); }
+            console.log('OK order: '+rows.length+' sejak '+cut);
+          } else { console.error('SKIP tulis orders (tarik ga lengkap). Data lama aman, tunggu run berikutnya.'); }
 
           // ===== 2) REFUNDS + GRAB/TOKO (dari GetTransactions) ===== (created_after + sort DESC)
           const GT_CUT='2026-01-01';                    // histori grab/toko ditarik sejak Januari
@@ -88,12 +101,16 @@ jobs:
           const txCa = WIDE ? (GT_CUT+'T00:00:00') : caCut;
           const PT={ 'GRAB MART':'grabmart', 'TOKOPEDIA':'tokopedia' };
           const refs=[], seen={}, gtx=[];
-          { let p=1, guard=0;
+          { let p=1, guard=0; const txStop = WIDE ? GT_CUT : cut;
             while(guard++<600){ const r=await getTx(p,txCa); if(!r) break; const tt=r.transactions||[]; if(!tt.length) break;
               for(const t of tt){ const d=(t.transaction_date||'').slice(0,10);
                 if(t.type==='refund' && d>=cut){ const id=String(t.transaction_id||''); if(!seen[id]){ seen[id]=1; refs.push({date:d, ref:t.order_reference||'', amount:Number(t.amount)||0}); } }
                 else if(WIDE && t.type==='sale' && PT[t.payment_type_name] && d>=GT_CUT){ gtx.push({ref:t.order_reference||'', date:d, amt:Number(t.amount)||0, ch:PT[t.payment_type_name]}); }
               }
+              // sort DESC -> transaksi TERTUA di akhir array. Kalau udah < batas (txStop),
+              //   halaman berikut pasti lebih lama -> STOP (biar ga scan sampai infinite/timeout).
+              const oldest=(tt[tt.length-1].transaction_date||'').slice(0,10);
+              if(oldest && oldest < txStop) break;
               p++;
             }
             console.log('tx: '+refs.length+' refund + '+gtx.length+' grab/toko dari '+(p-1)+' halaman (created_after='+txCa+')'); }
