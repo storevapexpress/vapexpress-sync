@@ -86,12 +86,18 @@ jobs:
               p++;
             }
             console.log('orders: '+rows.length+' baris (order_date>='+cut+') dari '+(p-1)+' halaman (created_after='+caCut+')'+(ordersFail?' [GAGAL SEBAGIAN - SKIP tulis]':'')); }
-          // hapus order (BUKAN refund) di jendela, lalu insert order — CUMA kalau tarik SUKSES penuh.
-          if(!ordersFail){
+          // PROTEKSI ANTI-TIMPA: cek berapa order yg UDAH ADA di DB (jendela ini). Kalau data baru
+          //   (rows) jauh lebih SEDIKIT dari yg udah ada -> tarik ga lengkap -> JANGAN timpa
+          //   (biar data valid/import manual ga ke-DELETE & diganti data bolong).
+          let existing=0;
+          try{ const er=await fetch(SUPA+'/rest/v1/iseller_orders?date=gte.'+cut+'&channel=neq.refund&select=ref',{headers:{...SH,Prefer:'count=exact',Range:'0-0'}}); const cr=er.headers.get('content-range'); existing=cr?Number((cr.split('/')[1]||0)):0; }catch(e){}
+          // ambang: data baru minimal 90% dari yg udah ada. Kalau kurang -> curiga ga lengkap -> skip.
+          const cukup = rows.length >= Math.floor(existing*0.9);
+          if(!ordersFail && cukup){
             await fetch(SUPA+'/rest/v1/iseller_orders?date=gte.'+cut+'&channel=neq.refund',{method:'DELETE',headers:SH});
             for(let i=0;i<rows.length;i+=500){ const ch=rows.slice(i,i+500); await fetch(SUPA+'/rest/v1/iseller_orders',{method:'POST',headers:{...SH,'Content-Type':'application/json',Prefer:'return=minimal'},body:JSON.stringify(ch)}); }
-            console.log('OK order: '+rows.length+' sejak '+cut);
-          } else { console.error('SKIP tulis orders (tarik ga lengkap). Data lama aman, tunggu run berikutnya.'); }
+            console.log('OK order: '+rows.length+' sejak '+cut+' (existing '+existing+')');
+          } else { console.error('SKIP tulis orders: rows='+rows.length+' existing='+existing+(ordersFail?' [fetch gagal]':' [ga cukup, <90% existing]')+'. Data lama dipertahankan.'); }
 
           // ===== 2) REFUNDS + GRAB/TOKO (dari GetTransactions) ===== (created_after + sort DESC)
           const GT_CUT='2026-01-01';                    // histori grab/toko ditarik sejak Januari
@@ -156,3 +162,4 @@ jobs:
           }catch(e){ console.error('items pass gagal (dilewati):', e.message); }
           EOF
           node sync.mjs
+
