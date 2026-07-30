@@ -57,11 +57,13 @@ jobs:
           if(WIDE){ cd.setUTCDate(1); cd.setUTCDate(cd.getUTCDate()-4); }
           else { cd.setUTCDate(cd.getUTCDate()-1); }
           const cut=cd.toISOString().slice(0,10);
-          // created_after buat AMBIL data. PENTING: order bisa di-create/edit TELAT (order_date kemarin
-          //   tapi created hari ini, atau sebaliknya). Biar GA ADA yg kedodoran, mundur JAUH (10 hari)
-          //   -> pasti nangkep semua order yg order_date-nya masuk window. Tetap ringan krn filter
-          //   simpan pakai order_date>=cut (cuma 2 hari yg disimpan). Owner: "cek semua, sama persis iSeller".
-          const caD=new Date(cd.getTime()); caD.setUTCDate(caD.getUTCDate()-10);
+          // created_after buat AMBIL data. Order bisa di-create/edit TELAT (order_date kemarin tapi
+          //   created hari ini, atau sebaliknya) -> mundur 2 hari dari cut, cukup nangkep semua order
+          //   yg order_date-nya masuk window (cut=H-1) TANPA kebanyakan data. PENTING: mundur JAUH
+          //   (mis. 10 hari) bikin robot narik puluhan ribu order/ratusan halaman -> iSeller timeout
+          //   di tengah -> ordersFail -> SKIP nulis -> data hari ini STUCK. 2 hari = ringan & aman.
+          //   Filter simpan tetap order_date>=cut (cuma 2 hari yg disimpan). Owner: "sama persis iSeller".
+          const caD=new Date(cd.getTime()); caD.setUTCDate(caD.getUTCDate()-2);
           const caCut=caD.toISOString().slice(0,10)+'T00:00:00';
           console.log('MODE '+(WIDE?'FULL (rekonsiliasi sebulan)':'cepat (refresh penuh 2 hari)')+' · cut='+cut+' · created_after='+caCut);
 
