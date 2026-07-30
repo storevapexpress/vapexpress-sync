@@ -15,7 +15,7 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 10       # auto-mati kalau kelamaan (anti-hang; run normal < 3 menit)
+    timeout-minutes: 20       # auto-mati kalau kelamaan (anti-hang; run normal < 3 menit, full < 12 menit)
     steps:
       - name: Tarik order + refund terbaru iSeller -> Supabase
         env:
@@ -100,8 +100,13 @@ jobs:
           } else { console.error('SKIP tulis orders: fetch gagal di tengah. Data lama dipertahankan, tunggu run berikutnya.'); }
 
           // ===== 2) REFUNDS + GRAB/TOKO (dari GetTransactions) ===== (created_after + sort DESC)
-          const GT_CUT='2026-01-01';                    // histori grab/toko ditarik sejak Januari
-          // created_after buat AMBIL: fast mundur 3 hari (caCut), WIDE dari Januari (biar grab/toko kekejar)
+          // GT_CUT: batas histori grab/toko. DULU '2026-01-01' (7 bulan) -> pas WIDE robot narik ratusan
+          //   halaman transaksi -> TIMEOUT 10-20 menit -> di-cancel -> GA NULIS APA2 -> selisih ga kelar.
+          //   FIX: WIDE cukup mundur ke AWAL BULAN BERJALAN (grab/toko bulan ini) -> ringan, ga timeout.
+          //   Histori grab/toko bulan-bulan lalu sudah tersimpan & TIDAK dihapus (report_data numpuk).
+          const _gm=new Date(nowWIB.getTime()); _gm.setUTCDate(1);
+          const GT_CUT=_gm.toISOString().slice(0,10);   // awal bulan berjalan (mis. 2026-07-01)
+          // created_after buat AMBIL: fast mundur 2 hari (caCut), WIDE dari awal bulan (biar grab/toko kekejar)
           const txCa = WIDE ? (GT_CUT+'T00:00:00') : caCut;
           const PT={ 'GRAB MART':'grabmart', 'TOKOPEDIA':'tokopedia' };
           const refs=[], seen={}, gtx=[];
@@ -138,9 +143,12 @@ jobs:
           // Cuma refresh 3 HARI terakhir (nangkep order telat sync), TIDAK hapus histori lama -> data numpuk & ringan.
           // Histori awal ditarik sekali (script pull-items-now.ps1). HOT (belanja 13-14 hari lalu) sudah pasti ada dari cicilan hari2 sebelumnya.
           try{
-            // WIDE/full = tarik dari AWAL BULAN (isi histori pertama kali / rekonsiliasi). Run biasa = cukup 3 hari.
+            // Run biasa = 3 hari. WIDE/full = 7 hari (BUKAN awal bulan lagi -> awal bulan bikin
+            //   getPageD narik ratusan halaman + OrderDetails -> TIMEOUT. Order-items cuma buat HOT
+            //   (belanja 13-14 hari lalu) yg sudah pasti ada dari cicilan harian; 7 hari cukup buat self-heal.
+            //   Histori items lama TIDAK disentuh. Isi histori pertama kali pakai pull-items-now.ps1.)
             const idCut=new Date(nowWIB.getTime());
-            if(WIDE){ idCut.setUTCDate(1); } else { idCut.setUTCDate(idCut.getUTCDate()-3); }
+            if(WIDE){ idCut.setUTCDate(idCut.getUTCDate()-7); } else { idCut.setUTCDate(idCut.getUTCDate()-3); }
             const iCut=idCut.toISOString().slice(0,10);
             // created_after buat AMBIL items: mundur 3 hari dari iCut (aman timezone/telat)
             const iCaD=new Date(idCut.getTime()); iCaD.setUTCDate(iCaD.getUTCDate()-3);
