@@ -38,7 +38,7 @@ jobs:
           // created_after (ISO tanpa tz) + sort CreatedDate DESC -> order TERBARU di page 1.
           //   Jauh lebih hemat: ga perlu scan ribuan halaman dari belakang.
           //   ca = 'YYYY-MM-DDTHH:MM:SS' (WIB, karena time_zone:7).
-          async function getPage(p,ca){ const b={time_zone:7,page:p,sort:'CreatedDate',sort_direction:'DESC'}; if(ca) b.created_after=ca; for(let i=0;i<6;i++){ try{ const r=await fetch(base+'/GetOrders',{method:'POST',headers:H,body:JSON.stringify(b)}); if(r.ok) return await r.json(); }catch(e){} await sleep(2000);} return null; }
+          async function getPage(p,ca,cb){ const b={time_zone:7,page:p,sort:'CreatedDate',sort_direction:'DESC'}; if(ca) b.created_after=ca; if(cb) b.created_before=cb; for(let i=0;i<6;i++){ try{ const r=await fetch(base+'/GetOrders',{method:'POST',headers:H,body:JSON.stringify(b)}); if(r.ok) return await r.json(); }catch(e){} await sleep(2000);} return null; }
           async function getPageD(p,ca){ const b={time_zone:7,page:p,includes:'OrderDetails',sort:'CreatedDate',sort_direction:'DESC'}; if(ca) b.created_after=ca; for(let i=0;i<6;i++){ try{ const r=await fetch(base+'/GetOrders',{method:'POST',headers:H,body:JSON.stringify(b)}); if(r.ok) return await r.json(); }catch(e){} await sleep(2000);} return null; }
           async function getTx(p,ca){ const b={time_zone:7,page:p,page_size:5000,sort:'CreatedDate',sort_direction:'DESC'}; if(ca) b.created_after=ca; for(let i=0;i<6;i++){ try{ const r=await fetch(base+'/GetTransactions',{method:'POST',headers:H,body:JSON.stringify(b)}); if(r.ok) return await r.json(); }catch(e){} await sleep(2000);} return null; }
           // (dulu ada findLast/stGet/stSet buat scan halaman dari belakang — sekarang ga perlu,
@@ -67,32 +67,42 @@ jobs:
           const caCut=caD.toISOString().slice(0,10)+'T00:00:00';
           console.log('MODE '+(WIDE?'FULL (rekonsiliasi sebulan)':'cepat (refresh penuh 2 hari)')+' · cut='+cut+' · created_after='+caCut);
 
-          // ===== 1) ORDERS ===== (created_after + sort DESC: page 1 = terbaru)
-          // Server udah MEMFILTER by created_after -> semua halaman isinya cuma order sejak caCut.
-          //   Tinggal ambil page 1,2,3… sampai halaman KOSONG (habis). Guard 400 = pengaman.
-          //   Filter simpan tetap pakai order_date>=cut -> hasil di Supabase identik cara lama.
+          // ===== 1) ORDERS ===== (PER-HARI: created_after + created_before per tanggal, sort DESC)
+          // PENTING: iSeller GetOrders MENTOK di ~1235 order per query (pagination limit). Kalau narik
+          //   1 window besar (mis. 29+30 Juli gabung), begitu total >1235 -> halaman berikutnya KOSONG
+          //   walau data masih ada -> robot kira habis -> order paling lama KEPOTONG (188 order 30 Juli
+          //   hilang, selisih Rp30jt). FIX: tarik PER TANGGAL terpisah (created_after=00:00 tgl itu,
+          //   created_before=00:00 besoknya). 1 hari max ~500 order << 1235 -> GA PERNAH mentok.
           const rows=[]; let ordersFail=false;
-          { let p=1, guard=0;
+          // daftar tanggal dari cut s/d hari ini (WIB)
+          const days=[]; { let dd=new Date(cut+'T00:00:00Z'); const today=nowWIB.toISOString().slice(0,10);
+            while(dd.toISOString().slice(0,10)<=today){ days.push(dd.toISOString().slice(0,10)); dd.setUTCDate(dd.getUTCDate()+1); } }
+          for(const day of days){
+            if(ordersFail) break;
+            const dNext=new Date(day+'T00:00:00Z'); dNext.setUTCDate(dNext.getUTCDate()+1);
+            const ca=day+'T00:00:00', cb=dNext.toISOString().slice(0,10)+'T00:00:00';
+            let p=1, guard=0, dayCnt=0;
             while(guard++<400){
-              const r=await getPage(p,caCut);
-              // BEDAKAN gagal-fetch vs habis: r=null -> FETCH GAGAL (retry 3x mentok) -> JANGAN stop
-              //   diam2 (bikin order kepotong). Tandai gagal & stop, nanti DELETE+INSERT di-SKIP
+              const r=await getPage(p,ca,cb);
+              // r=null -> FETCH GAGAL (retry 6x mentok) -> tandai gagal & stop, DELETE+INSERT di-SKIP
               //   biar data lama TETAP AMAN (lebih baik ga update drpd nimpa dgn data bolong).
-              if(!r){ ordersFail=true; console.error('getPage gagal di page '+p+' -> ABORT orders (data lama dipertahankan)'); break; }
-              const o=r.orders||[]; if(!o.length) break;   // beneran habis
+              if(!r){ ordersFail=true; console.error('getPage gagal di '+day+' page '+p+' -> ABORT orders (data lama dipertahankan)'); break; }
+              const o=r.orders||[]; if(!o.length) break;   // habis utk tanggal ini
               for(const x of o){ const d=(x.order_date||'').slice(0,10); if(d<cut) continue;
                 // paid=true kalau UDAH DIBAYAR. Order 'completed' = udah dibayar (termasuk yg lalu
                 //   di-refund/'Dikembalikan' -> payment_status jadi 'refunded' tapi tetap masuk KOTOR,
                 //   samain cara iSeller: Bersih = Kotor - Refund). 'draft'/belum bayar TIDAK dihitung.
                 const isPaid = (x.status==='completed') || (x.payment_status==='paid');
-                rows.push({date:d, outlet:x.outlet_name||'', cashier:((x.cashier_first_name||'')+' '+(x.cashier_last_name||'')).trim(), customer:((x.customer_first_name||'')+' '+(x.customer_last_name||'')).trim(), phone:x.customer_phone_number||'', total:Number(x.total_amount)||0, status:x.status||'', paid:isPaid, ref:x.order_reference||'', channel:x.channel||''}); }
-              // Server udah filter by created_after -> scan sampai halaman KOSONG (habis). Guard 400 = backstop.
+                rows.push({date:d, outlet:x.outlet_name||'', cashier:((x.cashier_first_name||'')+' '+(x.cashier_last_name||'')).trim(), customer:((x.customer_first_name||'')+' '+(x.customer_last_name||'')).trim(), phone:x.customer_phone_number||'', total:Number(x.total_amount)||0, status:x.status||'', paid:isPaid, ref:x.order_reference||'', channel:x.channel||''}); dayCnt++; }
               p++;
             }
-            console.log('orders: '+rows.length+' baris (order_date>='+cut+') dari '+(p-1)+' halaman (created_after='+caCut+')'+(ordersFail?' [GAGAL SEBAGIAN - SKIP tulis]':'')); }
+            if(!ordersFail) console.log('  '+day+': '+dayCnt+' order ('+(p-1)+' halaman)');
+          }
+          console.log('orders: '+rows.length+' baris total (order_date>='+cut+', per-hari '+days.length+' tanggal)'+(ordersFail?' [GAGAL SEBAGIAN - SKIP tulis]':''));
           // PROTEKSI: tulis (DELETE+INSERT penuh) HANYA kalau tarik SUKSES PENUH (ga ada getPage gagal).
-          //   Karena created_after mundur 10 hari, robot PASTI nangkep semua order di window -> refresh
-          //   penuh 2 hari = dashboard sama persis iSeller. Kalau fetch gagal di tengah -> SKIP (data lama aman).
+          //   Narik PER-HARI (created_after..created_before per tanggal) -> ga pernah mentok limit ~1235
+          //   -> robot PASTI nangkep SEMUA order tiap tanggal -> dashboard sama persis iSeller.
+          //   Kalau fetch gagal di tengah -> SKIP tulis (data lama dipertahankan, tunggu run berikutnya).
           if(!ordersFail){
             await fetch(SUPA+'/rest/v1/iseller_orders?date=gte.'+cut+'&channel=neq.refund',{method:'DELETE',headers:SH});
             for(let i=0;i<rows.length;i+=500){ const ch=rows.slice(i,i+500); await fetch(SUPA+'/rest/v1/iseller_orders',{method:'POST',headers:{...SH,'Content-Type':'application/json',Prefer:'return=minimal'},body:JSON.stringify(ch)}); }
