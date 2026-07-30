@@ -57,11 +57,13 @@ jobs:
           if(WIDE){ cd.setUTCDate(1); cd.setUTCDate(cd.getUTCDate()-4); }
           else { cd.setUTCDate(cd.getUTCDate()-1); }
           const cut=cd.toISOString().slice(0,10);
-          // created_after buat AMBIL data (hemat call). Mundur 3 hari dari 'cut' biar aman
-          //   thd selisih timezone + order/pembayaran telat. Format ISO tanpa tz (WIB).
-          const caD=new Date(cd.getTime()); caD.setUTCDate(caD.getUTCDate()-3);
+          // created_after buat AMBIL data. PENTING: order bisa di-create/edit TELAT (order_date kemarin
+          //   tapi created hari ini, atau sebaliknya). Biar GA ADA yg kedodoran, mundur JAUH (10 hari)
+          //   -> pasti nangkep semua order yg order_date-nya masuk window. Tetap ringan krn filter
+          //   simpan pakai order_date>=cut (cuma 2 hari yg disimpan). Owner: "cek semua, sama persis iSeller".
+          const caD=new Date(cd.getTime()); caD.setUTCDate(caD.getUTCDate()-10);
           const caCut=caD.toISOString().slice(0,10)+'T00:00:00';
-          console.log('MODE '+(WIDE?'FULL (rekonsiliasi sebulan)':'cepat (2 hari)')+' · cut='+cut+' · created_after='+caCut);
+          console.log('MODE '+(WIDE?'FULL (rekonsiliasi sebulan)':'cepat (refresh penuh 2 hari)')+' · cut='+cut+' · created_after='+caCut);
 
           // ===== 1) ORDERS ===== (created_after + sort DESC: page 1 = terbaru)
           // Server udah MEMFILTER by created_after -> semua halaman isinya cuma order sejak caCut.
@@ -86,18 +88,14 @@ jobs:
               p++;
             }
             console.log('orders: '+rows.length+' baris (order_date>='+cut+') dari '+(p-1)+' halaman (created_after='+caCut+')'+(ordersFail?' [GAGAL SEBAGIAN - SKIP tulis]':'')); }
-          // PROTEKSI ANTI-TIMPA: cek berapa order yg UDAH ADA di DB (jendela ini). Kalau data baru
-          //   (rows) jauh lebih SEDIKIT dari yg udah ada -> tarik ga lengkap -> JANGAN timpa
-          //   (biar data valid/import manual ga ke-DELETE & diganti data bolong).
-          let existing=0;
-          try{ const er=await fetch(SUPA+'/rest/v1/iseller_orders?date=gte.'+cut+'&channel=neq.refund&select=ref',{headers:{...SH,Prefer:'count=exact',Range:'0-0'}}); const cr=er.headers.get('content-range'); existing=cr?Number((cr.split('/')[1]||0)):0; }catch(e){}
-          // ambang: data baru minimal 90% dari yg udah ada. Kalau kurang -> curiga ga lengkap -> skip.
-          const cukup = rows.length >= Math.floor(existing*0.9);
-          if(!ordersFail && cukup){
+          // PROTEKSI: tulis (DELETE+INSERT penuh) HANYA kalau tarik SUKSES PENUH (ga ada getPage gagal).
+          //   Karena created_after mundur 10 hari, robot PASTI nangkep semua order di window -> refresh
+          //   penuh 2 hari = dashboard sama persis iSeller. Kalau fetch gagal di tengah -> SKIP (data lama aman).
+          if(!ordersFail){
             await fetch(SUPA+'/rest/v1/iseller_orders?date=gte.'+cut+'&channel=neq.refund',{method:'DELETE',headers:SH});
             for(let i=0;i<rows.length;i+=500){ const ch=rows.slice(i,i+500); await fetch(SUPA+'/rest/v1/iseller_orders',{method:'POST',headers:{...SH,'Content-Type':'application/json',Prefer:'return=minimal'},body:JSON.stringify(ch)}); }
-            console.log('OK order: '+rows.length+' sejak '+cut+' (existing '+existing+')');
-          } else { console.error('SKIP tulis orders: rows='+rows.length+' existing='+existing+(ordersFail?' [fetch gagal]':' [ga cukup, <90% existing]')+'. Data lama dipertahankan.'); }
+            console.log('OK order: '+rows.length+' refresh penuh sejak '+cut);
+          } else { console.error('SKIP tulis orders: fetch gagal di tengah. Data lama dipertahankan, tunggu run berikutnya.'); }
 
           // ===== 2) REFUNDS + GRAB/TOKO (dari GetTransactions) ===== (created_after + sort DESC)
           const GT_CUT='2026-01-01';                    // histori grab/toko ditarik sejak Januari
@@ -162,4 +160,3 @@ jobs:
           }catch(e){ console.error('items pass gagal (dilewati):', e.message); }
           EOF
           node sync.mjs
-
