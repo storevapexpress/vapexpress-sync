@@ -1,7 +1,7 @@
 name: Sync iSeller ke Supabase
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '*/10 * * * *'   # tiap 10 menit (cadangan; pemicu utama = cron-job.org tiap 10 menit)
   workflow_dispatch:
     inputs:
       mode:
@@ -67,38 +67,57 @@ jobs:
           const caCut=caD.toISOString().slice(0,10)+'T00:00:00';
           console.log('MODE '+(WIDE?'FULL (rekonsiliasi sebulan)':'cepat (refresh penuh 2 hari)')+' · cut='+cut+' · created_after='+caCut);
 
-          // ===== 1) ORDERS ===== (PER-HARI: created_after + created_before per tanggal, sort DESC)
-          // PENTING: iSeller GetOrders MENTOK di ~1235 order per query (pagination limit). Kalau narik
-          //   1 window besar (mis. 29+30 Juli gabung), begitu total >1235 -> halaman berikutnya KOSONG
-          //   walau data masih ada -> robot kira habis -> order paling lama KEPOTONG (188 order 30 Juli
-          //   hilang, selisih Rp30jt). FIX: tarik PER TANGGAL terpisah (created_after=00:00 tgl itu,
-          //   created_before=00:00 besoknya). 1 hari max ~500 order << 1235 -> GA PERNAH mentok.
-          const rows=[]; let ordersFail=false;
-          // daftar tanggal dari cut s/d hari ini (WIB)
-          const days=[]; { let dd=new Date(cut+'T00:00:00Z'); const today=nowWIB.toISOString().slice(0,10);
-            while(dd.toISOString().slice(0,10)<=today){ days.push(dd.toISOString().slice(0,10)); dd.setUTCDate(dd.getUTCDate()+1); } }
-          for(const day of days){
-            if(ordersFail) break;
-            const dNext=new Date(day+'T00:00:00Z'); dNext.setUTCDate(dNext.getUTCDate()+1);
-            const ca=day+'T00:00:00', cb=dNext.toISOString().slice(0,10)+'T00:00:00';
-            let p=1, guard=0, dayCnt=0;
-            while(guard++<400){
-              const r=await getPage(p,ca,cb);
-              // r=null -> FETCH GAGAL (retry 6x mentok) -> tandai gagal & stop, DELETE+INSERT di-SKIP
-              //   biar data lama TETAP AMAN (lebih baik ga update drpd nimpa dgn data bolong).
-              if(!r){ ordersFail=true; console.error('getPage gagal di '+day+' page '+p+' -> ABORT orders (data lama dipertahankan)'); break; }
-              const o=r.orders||[]; if(!o.length) break;   // habis utk tanggal ini
-              for(const x of o){ const d=(x.order_date||'').slice(0,10); if(d<cut) continue;
-                // paid=true kalau UDAH DIBAYAR. Order 'completed' = udah dibayar (termasuk yg lalu
-                //   di-refund/'Dikembalikan' -> payment_status jadi 'refunded' tapi tetap masuk KOTOR,
-                //   samain cara iSeller: Bersih = Kotor - Refund). 'draft'/belum bayar TIDAK dihitung.
-                const isPaid = (x.status==='completed') || (x.payment_status==='paid');
-                rows.push({date:d, outlet:x.outlet_name||'', cashier:((x.cashier_first_name||'')+' '+(x.cashier_last_name||'')).trim(), customer:((x.customer_first_name||'')+' '+(x.customer_last_name||'')).trim(), phone:x.customer_phone_number||'', total:Number(x.total_amount)||0, status:x.status||'', paid:isPaid, ref:x.order_reference||'', channel:x.channel||''}); dayCnt++; }
+          // ===== 1) ORDERS ===== (created_after window + sort DESC, TANPA created_before)
+          // KENAPA TANPA created_before: iSeller kelompokin per ORDER_DATE (tgl transaksi), tapi filter
+          //   created_before itu per CREATED_DATE (tgl dibuat). Order transaksi 29 tapi di-close kasir 30
+          //   -> created_before motong dia di dua-duanya -> order HILANG (29 turun 933->734). JADI: pakai
+          //   1 window created_after aja (mundur cukup jauh), lalu SARING pakai order_date>=cut. Ga motong.
+          // LIMIT 1235: iSeller mentok ~1235 order/query. Biar aman, run cepat window = 2 hari (cut=H-1,
+          //   ca=H-3) -> max ~1000 order < 1235. Tanggal lama di-reconcile mode full (per potongan).
+          // Ambil order dgn 1 window created_after (mulai dari 'ca'), saring order_date>=dFrom & <dTo.
+          //   sort DESC + created_after cukup jauh -> nangkep order yg created telat. Filter pakai
+          //   order_date (BUKAN created_before) -> GA MOTONG order yg created beda dari transaksi.
+          //   Return {rows, fail}. dedup by ref di caller.
+          async function pullOrders(ca, dFrom, dTo){
+            const out=[]; let fail=false, p=1, guard=0;
+            while(guard++<600){
+              const r=await getPage(p,ca);
+              if(!r){ fail=true; console.error('getPage gagal page '+p+' (ca='+ca+') -> ABORT'); break; }
+              const o=r.orders||[]; if(!o.length) break;
+              for(const x of o){ const d=(x.order_date||'').slice(0,10); if(d<dFrom||d>=dTo) continue;
+                const isPaid=(x.status==='completed')||(x.payment_status==='paid');
+                out.push({date:d, outlet:x.outlet_name||'', cashier:((x.cashier_first_name||'')+' '+(x.cashier_last_name||'')).trim(), customer:((x.customer_first_name||'')+' '+(x.customer_last_name||'')).trim(), phone:x.customer_phone_number||'', total:Number(x.total_amount)||0, status:x.status||'', paid:isPaid, ref:x.order_reference||'', channel:x.channel||''}); }
               p++;
             }
-            if(!ordersFail) console.log('  '+day+': '+dayCnt+' order ('+(p-1)+' halaman)');
+            return {rows:out, fail};
           }
-          console.log('orders: '+rows.length+' baris total (order_date>='+cut+', per-hari '+days.length+' tanggal)'+(ordersFail?' [GAGAL SEBAGIAN - SKIP tulis]':''));
+          const today=nowWIB.toISOString().slice(0,10);
+          const dTo=(()=>{ const t=new Date(nowWIB.getTime()); t.setUTCDate(t.getUTCDate()+1); return t.toISOString().slice(0,10); })();
+          let rows=[], ordersFail=false;
+          if(!WIDE){
+            // RUN CEPAT: window 2 hari (cut..hari ini). ca=caCut (H-3). <1235 -> ga mentok limit.
+            const rr=await pullOrders(caCut, cut, dTo);
+            rows=rr.rows; ordersFail=rr.fail;
+            console.log('orders: '+rows.length+' baris (order_date '+cut+'..'+today+') created_after='+caCut+(ordersFail?' [GAGAL - SKIP]':''));
+          } else {
+            // MODE FULL: rekonsiliasi PER-HARI (cut..hari ini). Tiap tanggal: created_after=tgl-3
+            //   (nangkep created telat) lalu saring order_date==tgl itu. Window kecil per hari -> GA
+            //   mentok limit 1235, dan saring pakai order_date -> GA motong. Ini yg bikin sama persis iSeller.
+            const byRef={};
+            let dd=new Date(cut+'T00:00:00Z');
+            while(dd.toISOString().slice(0,10)<=today){
+              const day=dd.toISOString().slice(0,10);
+              const dNext=new Date(dd.getTime()); dNext.setUTCDate(dNext.getUTCDate()+1); const dayNext=dNext.toISOString().slice(0,10);
+              const caD=new Date(dd.getTime()); caD.setUTCDate(caD.getUTCDate()-3); const ca=caD.toISOString().slice(0,10)+'T00:00:00';
+              const rr=await pullOrders(ca, day, dayNext);
+              if(rr.fail){ ordersFail=true; console.error('FULL gagal di '+day+' -> ABORT total'); break; }
+              for(const row of rr.rows){ if(row.ref) byRef[row.ref]=row; }
+              console.log('  '+day+': '+rr.rows.length+' order');
+              dd.setUTCDate(dd.getUTCDate()+1);
+            }
+            rows=Object.values(byRef);
+            console.log('orders(FULL): '+rows.length+' baris total ('+cut+'..'+today+')'+(ordersFail?' [GAGAL - SKIP]':''));
+          }
           // PROTEKSI: tulis (DELETE+INSERT penuh) HANYA kalau tarik SUKSES PENUH (ga ada getPage gagal).
           //   Narik PER-HARI (created_after..created_before per tanggal) -> ga pernah mentok limit ~1235
           //   -> robot PASTI nangkep SEMUA order tiap tanggal -> dashboard sama persis iSeller.
