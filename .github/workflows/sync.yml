@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'auto = normal (2 hari) · full = rekonsiliasi sebulan penuh (tarik ulang untuk nyocokin ke iSeller)'
+        description: 'auto = normal · full = rekonsiliasi sebulan (pakai bulan=YYYY-MM) · grabonly = tarik histori Grab/Tokopedia (pakai bulan=YYYY-MM mulai, kosong=Januari)'
         default: 'auto'
         required: false
       bulan:
@@ -48,6 +48,38 @@ jobs:
           async function getTx(p,ca){ const b={time_zone:7,page:p,page_size:5000,sort:'CreatedDate',sort_direction:'DESC'}; if(ca) b.created_after=ca; for(let i=0;i<6;i++){ try{ const r=await fetch(base+'/GetTransactions',{method:'POST',headers:H,body:JSON.stringify(b)}); if(r.ok) return await r.json(); }catch(e){} await sleep(2000);} return null; }
           // (dulu ada findLast/stGet/stSet buat scan halaman dari belakang — sekarang ga perlu,
           //  karena created_after + sort DESC langsung kasih order terbaru di page 1.)
+
+          // ===== MODE grabonly: rekonsiliasi HISTORI Grab/Tokopedia (report_data) dari created_after input.
+          //   Cuma narik GetTransactions (page_size 5000 -> sedikit halaman), saring Grab Mart/Tokopedia,
+          //   lookup outlet dari order, MERGE ke report_data (ga overwrite). Skip order/refund/items -> ringan.
+          //   Dipicu: MODE=grabonly, BULAN=YYYY-MM (mulai). Kosong -> Januari tahun ini.
+          if((process.env.MODE||'')==='grabonly'){
+            const bl=(process.env.BULAN||'').trim();
+            const gStart=/^\d{4}-\d{2}$/.test(bl) ? (bl+'-01') : (new Date(Date.now()+7*3600*1000).toISOString().slice(0,4)+'-01-01');
+            const gCa=gStart+'T00:00:00';
+            const PT={ 'GRAB MART':'grabmart', 'TOKOPEDIA':'tokopedia' };
+            console.log('MODE grabonly: tarik grab/toko sejak '+gStart);
+            const gtx=[]; { let p=1, guard=0;
+              while(guard++<600){ const r=await getTx(p,gCa); if(!r) break; const tt=r.transactions||[]; if(!tt.length) break;
+                for(const t of tt){ const d=(t.transaction_date||'').slice(0,10);
+                  if(t.type==='sale' && PT[t.payment_type_name] && d>=gStart){ gtx.push({ref:t.order_reference||'', date:d, amt:Number(t.amount)||0, ch:PT[t.payment_type_name]}); } }
+                p++; }
+              console.log('grabonly: '+gtx.length+' transaksi grab/toko dari '+(p-1)+' halaman'); }
+            // lookup outlet per ref
+            const uref=[...new Set(gtx.map(g=>g.ref))]; const omap={};
+            for(let i=0;i<uref.length;i+=80){ const b=uref.slice(i,i+80); const il=b.map(x=>'"'+x.replace(/#/g,'%23')+'"').join(','); try{ const rr=await fetch(SUPA+'/rest/v1/iseller_orders?ref=in.('+il+')&select=ref,outlet&limit=5000',{headers:SH}); const jj=await rr.json(); for(const row of jj){ if(!omap[row.ref]) omap[row.ref]={outlet:row.outlet}; } }catch(e){} }
+            const gt={ grabmart:{}, tokopedia:{} };
+            for(const g of gtx){ const out=(omap[g.ref]||{}).outlet||'(Lainnya)'; const bo=gt[g.ch]; if(!bo[out]) bo[out]={}; if(!bo[out][g.date]) bo[out][g.date]=[0,0]; bo[out][g.date][0]+=g.amt; bo[out][g.date][1]+=1; }
+            const stamp=new Date(Date.now()+7*3600*1000).toISOString().slice(0,16).replace('T',' ')+' WIB';
+            for(const key of ['grabmart','tokopedia']){ const bo=gt[key]; if(!Object.keys(bo).length) continue;
+              let old={}; try{ const rr=await fetch(SUPA+'/rest/v1/report_data?key=eq.'+key+'&select=data',{headers:SH}); const jj=await rr.json(); if(jj&&jj[0]&&jj[0].data&&jj[0].data.byOutlet) old=jj[0].data.byOutlet; }catch(e){}
+              const merged=JSON.parse(JSON.stringify(old));
+              for(const out in bo){ if(!merged[out]) merged[out]={}; for(const dt in bo[out]){ merged[out][dt]=bo[out][dt]; } }
+              await fetch(SUPA+'/rest/v1/report_data',{method:'POST',headers:{...SH,'Content-Type':'application/json',Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify({key:key, data:{updated:stamp, byOutlet:merged}})});
+              console.log('OK '+key+': '+Object.keys(bo).length+' outlet (merged sejak '+gStart+')');
+            }
+            console.log('grabonly SELESAI.'); process.exit(0);
+          }
 
           // ===== JENDELA SYNC =====
           // Normal: 2 hari (kemarin+hari ini) tiap 15 menit -> cepat & segar.
@@ -197,9 +229,16 @@ jobs:
             for(const g of gtx){ const out=(omap[g.ref]||{}).outlet||'(Lainnya)'; const bo=gt[g.ch]; if(!bo[out]) bo[out]={}; if(!bo[out][g.date]) bo[out][g.date]=[0,0]; bo[out][g.date][0]+=g.amt; bo[out][g.date][1]+=1; }
             const stamp=new Date(Date.now()+7*3600*1000).toISOString().slice(0,16).replace('T',' ')+' WIB';
             for(const key of ['grabmart','tokopedia']){ const bo=gt[key]; if(!Object.keys(bo).length) continue;
-              await fetch(SUPA+'/rest/v1/report_data',{method:'POST',headers:{...SH,'Content-Type':'application/json',Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify({key:key, data:{updated:stamp, byOutlet:bo}})});
+              // MERGE, JANGAN timpa: baca byOutlet LAMA dulu, gabung sama yg baru (per outlet per tanggal).
+              //   Kalau ga di-merge, robot yg cuma narik bulan ini bakal HAPUS histori bulan lalu (grab/toko
+              //   bulan lama ilang). Tanggal yg sama di-overwrite dgn angka baru (rekonsiliasi bener).
+              let old={};
+              try{ const rr=await fetch(SUPA+'/rest/v1/report_data?key=eq.'+key+'&select=data',{headers:SH}); const jj=await rr.json(); if(jj&&jj[0]&&jj[0].data&&jj[0].data.byOutlet) old=jj[0].data.byOutlet; }catch(e){}
+              const merged=JSON.parse(JSON.stringify(old));
+              for(const out in bo){ if(!merged[out]) merged[out]={}; for(const dt in bo[out]){ merged[out][dt]=bo[out][dt]; } }
+              await fetch(SUPA+'/rest/v1/report_data',{method:'POST',headers:{...SH,'Content-Type':'application/json',Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify({key:key, data:{updated:stamp, byOutlet:merged}})});
             }
-            console.log('OK grab/toko: grabmart '+Object.keys(gt.grabmart).length+' outlet · tokopedia '+Object.keys(gt.tokopedia).length+' outlet');
+            console.log('OK grab/toko (merged): grabmart '+Object.keys(gt.grabmart).length+' outlet · tokopedia '+Object.keys(gt.tokopedia).length+' outlet');
           }
 
           // ===== 4) ORDER ITEMS (produk per struk) — INCREMENTAL (nyicil per hari), buat Follow Up HOT =====
