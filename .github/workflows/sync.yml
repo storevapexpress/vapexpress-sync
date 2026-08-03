@@ -19,7 +19,7 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 20       # auto-mati kalau kelamaan (anti-hang; run normal < 3 menit, full < 12 menit)
+    timeout-minutes: 30       # auto-mati kalau kelamaan (run normal <3mnt; full window-sempit <15mnt; jaga2 30)
     steps:
       - name: Tarik order + refund terbaru iSeller -> Supabase
         env:
@@ -94,10 +94,10 @@ jobs:
           //   sort DESC + created_after cukup jauh -> nangkep order yg created telat. Filter pakai
           //   order_date (BUKAN created_before) -> GA MOTONG order yg created beda dari transaksi.
           //   Return {rows, fail}. dedup by ref di caller.
-          async function pullOrders(ca, dFrom, dTo){
+          async function pullOrders(ca, dFrom, dTo, cb){
             const out=[]; let fail=false, p=1, guard=0;
             while(guard++<600){
-              const r=await getPage(p,ca);
+              const r=await getPage(p,ca,cb);
               if(!r){ fail=true; console.error('getPage gagal page '+p+' (ca='+ca+') -> ABORT'); break; }
               const o=r.orders||[]; if(!o.length) break;
               for(const x of o){ const d=(x.order_date||'').slice(0,10); if(d<dFrom||d>=dTo) continue;
@@ -127,8 +127,13 @@ jobs:
             while(dd.toISOString().slice(0,10)<=fullTo){
               const day=dd.toISOString().slice(0,10);
               const dNext=new Date(dd.getTime()); dNext.setUTCDate(dNext.getUTCDate()+1); const dayNext=dNext.toISOString().slice(0,10);
+              // created_after = tgl-3 (nangkep created telat). created_before = tgl+2 (LONGGAR: ga motong
+              //   order yg created telat dikit, TAPI batesin window ~5 hari -> tiap query cuma sedikit
+              //   halaman -> GA timeout. Tanpa created_before, query narik SAMPAI SEKARANG tiap tanggal
+              //   -> Juni narik ribuan halaman -> 20mnt timeout.). Saring tetap order_date==tgl.
               const caD=new Date(dd.getTime()); caD.setUTCDate(caD.getUTCDate()-3); const ca=caD.toISOString().slice(0,10)+'T00:00:00';
-              const rr=await pullOrders(ca, day, dayNext);
+              const cbD=new Date(dd.getTime()); cbD.setUTCDate(cbD.getUTCDate()+2); const cb=cbD.toISOString().slice(0,10)+'T00:00:00';
+              const rr=await pullOrders(ca, day, dayNext, cb);
               if(rr.fail){ console.error('FULL gagal narik '+day+' -> SKIP tanggal ini, lanjut'); dd.setUTCDate(dd.getUTCDate()+1); continue; }
               // dedup by ref biar ga dobel
               const seen={}, dayRows=[]; for(const row of rr.rows){ if(row.ref && !seen[row.ref]){ seen[row.ref]=1; dayRows.push(row); } }
