@@ -8,6 +8,10 @@ on:
         description: 'auto = normal (2 hari) · full = rekonsiliasi sebulan penuh (tarik ulang untuk nyocokin ke iSeller)'
         default: 'auto'
         required: false
+      bulan:
+        description: 'Khusus mode=full: bulan yg mau direkonsiliasi (format YYYY-MM, mis. 2026-06). Kosong = bulan ini.'
+        default: ''
+        required: false
 concurrency:
   group: sync-iseller
   cancel-in-progress: false  # JANGAN cancel run yg lagi jalan (biar selesai penuh, ga nyicil).
@@ -24,6 +28,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           MODE: ${{ github.event.inputs.mode }}
+          BULAN: ${{ github.event.inputs.bulan }}
         run: |
           cat > sync.mjs <<'EOF'
           const CID=process.env.ISELLER_CLIENT_ID, CSEC=process.env.ISELLER_CLIENT_SECRET;
@@ -54,8 +59,19 @@ jobs:
           const _h=nowWIB.getUTCHours();
           const WIDE=(process.env.MODE==='full')||((_h===2 || _h===14) && nowWIB.getUTCMinutes()<15);
           const cd=new Date(nowWIB.getTime());
-          if(WIDE){ cd.setUTCDate(1); cd.setUTCDate(cd.getUTCDate()-4); }
-          else { cd.setUTCDate(cd.getUTCDate()-1); }
+          // RUN CEPAT: cut = HARI INI (bukan H-1). Robot cuma refresh HARI INI & seterusnya -> data
+          //   tanggal-tanggal lama AMAN, GA ke-timpa robot. Order hari ini sedikit -> ga mentok limit.
+          // FULL: default dari tgl 1 bulan ini. Kalau input BULAN diisi (YYYY-MM) -> rekonsiliasi bulan itu.
+          const BLN=(process.env.BULAN||'').trim();  // mis '2026-06'
+          let fullEnd=null;  // batas akhir loop full (kalau bulan lampau = akhir bulan itu)
+          if(WIDE){
+            if(/^\d{4}-\d{2}$/.test(BLN)){
+              cd.setUTCFullYear(+BLN.slice(0,4), +BLN.slice(5,7)-1, 1);
+              // akhir bulan = tgl 0 bulan berikutnya
+              const fe=new Date(Date.UTC(+BLN.slice(0,4), +BLN.slice(5,7), 0)); fullEnd=fe.toISOString().slice(0,10);
+            } else { cd.setUTCDate(1); }
+          }
+          // else: cut = hari ini (ga di-mundur)
           const cut=cd.toISOString().slice(0,10);
           // created_after buat AMBIL data. Order bisa di-create/edit TELAT (order_date kemarin tapi
           //   created hari ini, atau sebaliknya) -> mundur 2 hari dari cut, cukup nangkep semua order
@@ -101,33 +117,47 @@ jobs:
             console.log('orders: '+rows.length+' baris (order_date '+cut+'..'+today+') created_after='+caCut+(ordersFail?' [GAGAL - SKIP]':''));
           } else {
             // MODE FULL: rekonsiliasi PER-HARI (cut..hari ini). Tiap tanggal: created_after=tgl-3
-            //   (nangkep created telat) lalu saring order_date==tgl itu. Window kecil per hari -> GA
-            //   mentok limit 1235, dan saring pakai order_date -> GA motong. Ini yg bikin sama persis iSeller.
-            const byRef={};
-            let dd=new Date(cut+'T00:00:00Z');
-            while(dd.toISOString().slice(0,10)<=today){
+            //   (nangkep created telat) lalu saring order_date==tgl. Window kecil per hari -> GA mentok
+            //   limit 1235, saring pakai order_date -> GA motong. NULIS PER-HARI (DELETE+INSERT tiap
+            //   tanggal langsung, BUKAN numpuk di akhir) -> kalau kepotong/timeout di tengah, tanggal yg
+            //   udah kelar TETAP KESIMPEN. Dedup by ref per hari (anti dobel kalau ada bentrok).
+            const fullTo=fullEnd||today;   // bulan lampau -> akhir bulan itu; bulan ini -> hari ini
+            let dd=new Date(cut+'T00:00:00Z'), totFull=0;
+            console.log('FULL range: '+cut+' .. '+fullTo);
+            while(dd.toISOString().slice(0,10)<=fullTo){
               const day=dd.toISOString().slice(0,10);
               const dNext=new Date(dd.getTime()); dNext.setUTCDate(dNext.getUTCDate()+1); const dayNext=dNext.toISOString().slice(0,10);
               const caD=new Date(dd.getTime()); caD.setUTCDate(caD.getUTCDate()-3); const ca=caD.toISOString().slice(0,10)+'T00:00:00';
               const rr=await pullOrders(ca, day, dayNext);
-              if(rr.fail){ ordersFail=true; console.error('FULL gagal di '+day+' -> ABORT total'); break; }
-              for(const row of rr.rows){ if(row.ref) byRef[row.ref]=row; }
-              console.log('  '+day+': '+rr.rows.length+' order');
+              if(rr.fail){ console.error('FULL gagal narik '+day+' -> SKIP tanggal ini, lanjut'); dd.setUTCDate(dd.getUTCDate()+1); continue; }
+              // dedup by ref biar ga dobel
+              const seen={}, dayRows=[]; for(const row of rr.rows){ if(row.ref && !seen[row.ref]){ seen[row.ref]=1; dayRows.push(row); } }
+              // tulis PER-HARI: hapus tanggal ini dulu (non-refund), lalu insert fresh
+              await fetch(SUPA+'/rest/v1/iseller_orders?date=eq.'+day+'&channel=neq.refund',{method:'DELETE',headers:SH});
+              for(let i=0;i<dayRows.length;i+=500){ const ch=dayRows.slice(i,i+500); await fetch(SUPA+'/rest/v1/iseller_orders',{method:'POST',headers:{...SH,'Content-Type':'application/json',Prefer:'return=minimal'},body:JSON.stringify(ch)}); }
+              totFull+=dayRows.length; console.log('  '+day+': '+dayRows.length+' order (ditulis)');
               dd.setUTCDate(dd.getUTCDate()+1);
             }
-            rows=Object.values(byRef);
-            console.log('orders(FULL): '+rows.length+' baris total ('+cut+'..'+today+')'+(ordersFail?' [GAGAL - SKIP]':''));
+            console.log('orders(FULL): '+totFull+' baris total ditulis per-hari ('+cut+'..'+today+')');
+            rows=[]; ordersFail=false;   // full udah nulis sendiri per-hari -> lewati blok tulis di bawah
           }
-          // PROTEKSI: tulis (DELETE+INSERT penuh) HANYA kalau tarik SUKSES PENUH (ga ada getPage gagal).
-          //   Narik PER-HARI (created_after..created_before per tanggal) -> ga pernah mentok limit ~1235
-          //   -> robot PASTI nangkep SEMUA order tiap tanggal -> dashboard sama persis iSeller.
+          // PROTEKSI (khusus RUN CEPAT): tulis (DELETE+INSERT) HANYA kalau tarik SUKSES PENUH.
+          //   Narik window created_after + saring order_date -> ga motong. FULL udah nulis per-hari
+          //   di atas (rows kosong -> blok ini di-skip otomatis buat full).
           //   Kalau fetch gagal di tengah -> SKIP tulis (data lama dipertahankan, tunggu run berikutnya).
-          if(!ordersFail){
+          if(!WIDE && !ordersFail){
+            // CUMA RUN CEPAT. (WIDE/full udah nulis per-hari di atas -> JANGAN masuk sini, kalau ga
+            //   DELETE date>=cut + INSERT rows-kosong = HAPUS SEMUA DATA sebulan. Guard !WIDE wajib.)
             await fetch(SUPA+'/rest/v1/iseller_orders?date=gte.'+cut+'&channel=neq.refund',{method:'DELETE',headers:SH});
             for(let i=0;i<rows.length;i+=500){ const ch=rows.slice(i,i+500); await fetch(SUPA+'/rest/v1/iseller_orders',{method:'POST',headers:{...SH,'Content-Type':'application/json',Prefer:'return=minimal'},body:JSON.stringify(ch)}); }
             console.log('OK order: '+rows.length+' refresh penuh sejak '+cut);
-          } else { console.error('SKIP tulis orders: fetch gagal di tengah. Data lama dipertahankan, tunggu run berikutnya.'); }
+          } else if(!WIDE){ console.error('SKIP tulis orders: fetch gagal di tengah. Data lama dipertahankan, tunggu run berikutnya.'); }
 
+          // GUARD: kalau rekonsiliasi BULAN LAMPAU (input bulan diisi, fullEnd ada), CUMA benerin ORDER.
+          //   Skip refund/grab/items -> biar GA ngerusak refund bulan lain (DELETE date>=cut bisa kena
+          //   bulan setelahnya) & biar ringan. Order = yg dipermasalahin (omzet). Refund bulan lampau kecil.
+          if(fullEnd){ console.log('Rekonsiliasi bulan lampau '+cut+'..'+(fullEnd)+': ORDER only, skip refund/grab/items. SELESAI.'); }
+          else {
           // ===== 2) REFUNDS + GRAB/TOKO (dari GetTransactions) ===== (created_after + sort DESC)
           // GT_CUT: batas histori grab/toko. DULU '2026-01-01' (7 bulan) -> pas WIDE robot narik ratusan
           //   halaman transaksi -> TIMEOUT 10-20 menit -> di-cancel -> GA NULIS APA2 -> selisih ga kelar.
@@ -197,5 +227,6 @@ jobs:
             for(let i=0;i<items.length;i+=500){ const ch=items.slice(i,i+500); await fetch(SUPA+'/rest/v1/iseller_order_items',{method:'POST',headers:{...SH,'Content-Type':'application/json',Prefer:'return=minimal'},body:JSON.stringify(ch)}); }
             console.log('OK items: '+items.length+' produk (refresh 3 hari sejak '+iCut+', '+Object.keys(seenRef).length+' struk)');
           }catch(e){ console.error('items pass gagal (dilewati):', e.message); }
+          } // tutup guard: skip refund/grab/items kalau rekonsiliasi bulan lampau (fullEnd)
           EOF
           node sync.mjs
