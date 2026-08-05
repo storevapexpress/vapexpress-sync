@@ -91,19 +91,24 @@ jobs:
           const _h=nowWIB.getUTCHours();
           const WIDE=(process.env.MODE==='full')||((_h===2 || _h===14) && nowWIB.getUTCMinutes()<15);
           const cd=new Date(nowWIB.getTime());
-          // RUN CEPAT: cut = HARI INI (bukan H-1). Robot cuma refresh HARI INI & seterusnya -> data
-          //   tanggal-tanggal lama AMAN, GA ke-timpa robot. Order hari ini sedikit -> ga mentok limit.
+          // RUN CEPAT: cut = mana yg LEBIH BARU antara [tgl 1 bulan ini] & [H-4].
+          //   -> awal bulan (mis. skrg tgl 5): refresh tgl 1..hari ini (Agustus lengkap).
+          //   -> pertengahan bulan: cuma 4 hari terakhir (ringan, ga mentok limit 1235).
+          //   Data bulan LAMPAU (Mei-Juli yg di-inject) AMAN: di luar window & beda bulan.
           // FULL: default dari tgl 1 bulan ini. Kalau input BULAN diisi (YYYY-MM) -> rekonsiliasi bulan itu.
           const BLN=(process.env.BULAN||'').trim();  // mis '2026-06'
           let fullEnd=null;  // batas akhir loop full (kalau bulan lampau = akhir bulan itu)
           if(WIDE){
             if(/^\d{4}-\d{2}$/.test(BLN)){
               cd.setUTCFullYear(+BLN.slice(0,4), +BLN.slice(5,7)-1, 1);
-              // akhir bulan = tgl 0 bulan berikutnya
               const fe=new Date(Date.UTC(+BLN.slice(0,4), +BLN.slice(5,7), 0)); fullEnd=fe.toISOString().slice(0,10);
             } else { cd.setUTCDate(1); }
+          } else {
+            // run cepat: cut = max(awal bulan ini, H-4)
+            const awalBulan=new Date(nowWIB.getTime()); awalBulan.setUTCDate(1);
+            const hMin4=new Date(nowWIB.getTime()); hMin4.setUTCDate(hMin4.getUTCDate()-4);
+            cd.setTime(Math.max(awalBulan.getTime(), hMin4.getTime()));
           }
-          // else: cut = hari ini (ga di-mundur)
           const cut=cd.toISOString().slice(0,10);
           // created_after buat AMBIL data. Order bisa di-create/edit TELAT (order_date kemarin tapi
           //   created hari ini, atau sebaliknya) -> mundur 2 hari dari cut, cukup nangkep semua order
